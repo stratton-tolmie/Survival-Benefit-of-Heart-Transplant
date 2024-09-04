@@ -5,7 +5,7 @@ Stratton Tolmie, BA 1
 Robert Gibbons, PhD 2
 Allen S. Anderson, MD3, 4
 Kiran K. Khush, MD, MAS 5
-Kaveria Chhikara, MA 6
+Kaveri Chhikara, MA 6
 Matthew Churpek MD, MPH, PhD 7,8
 William Parker, MD, PhD 3,6
 
