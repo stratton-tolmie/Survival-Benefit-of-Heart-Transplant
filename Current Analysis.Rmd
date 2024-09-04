@@ -1,0 +1,644 @@
+---
+title: "Data Analysis"
+output: html_document
+---
+
+```{r}
+
+rm(list = ls())
+
+library(survival)
+library(ggplot2)
+library(ggfortify)
+library(tidyverse)
+library(survminer)
+library(ggsci)
+library(gridExtra)
+library(scales)
+library(tableone)
+library(dplyr)
+library(haven) #for reading SAS
+```
+
+```{r Read CSV}
+
+ts_status <- read.csv("ts_status.csv", row.names=1)
+
+cand_thor <- read_sas("cand_thor.sas7bdat", NULL) %>%  
+  zap_formats() %>% zap_labels()
+
+tx_hr <- read_sas("tx_hr.sas7bdat", NULL) %>%  
+  zap_formats() %>% zap_labels()
+
+test<-distinct(ts_status, PX_ID)
+
+min_ts_status <- ts_status %>% select(PX_ID, policy, policy_group, to_tx, to_die, first_ob, tx_obs_flag, last_ob, status, clean_status, dead, list_date, t_1, t_2, date_start, date_end, tx_date, dead_date, lafu_date, rem_date, rem_cd, last_act_date, fin_date, fin_time, final_date, first_status_def, clean_initial_status, tfl_last) %>%
+  group_by(PX_ID) %>% 
+  dplyr::mutate(last_ob = if_else(row_number()==n(), 1, 0)) %>% 
+  ungroup()
+
+```
+
+Study Population
+```{r}
+
+check_outcomes <- ts_status %>% 
+  group_by(PX_ID) %>% 
+  mutate(last_ob = if_else(row_number()==n(), 1, 0)) %>%
+  ungroup() %>%
+  filter(last_ob==1) %>% 
+  group_by(tx_obs_flag, dead) %>% 
+  tally()
+
+num_centers <- ts_status %>%
+  distinct(center_id)
+
+check_outcomes <- ts_status %>% 
+  group_by(PX_ID) %>% 
+  mutate(last_ob = if_else(row_number()==n(), 1, 0)) %>%
+  ungroup() %>%
+  filter(last_ob==1) %>% 
+  group_by(policy,tx_obs_flag, dead) %>% 
+  tally()
+
+check_fu <- ts_status %>% 
+  group_by(PX_ID) %>% 
+  mutate(last_ob = if_else(row_number()==n(), 1, 0)) %>%
+  ungroup() %>%
+  filter(last_ob==1) %>%
+  mutate(avg_fu = mean(t_2)) %>%
+  distinct(avg_fu)
+
+```
+
+
+
+KM Tx (to find inflection point for post-operative risk) 
+```{r}
+km_tx <- min_ts_status %>% 
+  filter(tx_obs_flag==1)
+ts_pol_oneobs <- km_tx[order(min_ts_status$last_ob, decreasing=TRUE),] 
+ts_pol_oneobs <- ts_pol_oneobs[!duplicated(ts_pol_oneobs$PX_ID),] 
+
+km_fit_tx <- survfit(Surv(fin_time, dead) ~ 1, data=ts_pol_oneobs)
+
+ggsurvplot(
+  fit = km_fit_tx, 
+  xlim=c(0,365),
+  xlab = "Days", ylab = "Post-Transplant Survival",
+  conf.int = TRUE, 
+  ylim = c(0.90,1.00), #include for figure production but can't generate p-value if ylim used
+  break.time.by=50,
+  censor=FALSE,
+  palette="jama"
+)
+
+#https://cran.r-project.org/web/packages/inflection/inflection.pdf
+library(inflection)
+  test <-data.frame(time=km_fit_tx$time, surv=km_fit_tx$surv) %>% filter(time<=120)
+  
+  
+#Method 1
+#aggressively smooth the data and find several inflection points, plot with average inflection point
+# Smooth the data using LOESS
+loess_smoother <- loess(surv~time, span=20, data=test)
+test$surv_smoothed <- loess_smoother$fitted
+# Calculate the second derivative of the smoothed curve
+smoothed_deriv2 <- diff(diff(predict(loess_smoother,newdata = test), differences = 2))
+# Find inflection points by checking for sign changes in the second derivative
+inflection_points <- which(diff(sign(smoothed_deriv2)) != 0) + 1
+# Average of inflection points
+avg_inflection <- mean(inflection_points)
+# Plot 
+ggplot(data = test, aes(x = time, y = surv_smoothed)) +
+  geom_point() +
+  geom_vline(xintercept = avg_inflection, color = 'black', linetype = 'dashed', alpha = 0.5) +
+  labs(x = "Days", y = "Smoothed Survival Probability") +
+  geom_text(aes(x = avg_inflection, y = max(test$surv_smoothed), label = avg_inflection), vjust = 3, hjust = -0.5)  
+ggsave("Post-Operative Risk Plot.pdf")
+
+#Supplemental Method 2
+# Smooth the data using LOESS
+myloess_smoother <- loess(test$surv~test$time, span=1)
+test$surv_smoothed <- predict(myloess_smoother,newdata = test)
+# Calculate inflection point using D2UIK 
+infl_tx <-d2uik(test$time, test$surv_smoothed)
+# Plot 
+ggplot(data=test, aes(x=time, y=surv_smoothed)) + 
+  geom_point() + 
+  geom_vline(xintercept=infl_tx, color='black', linetype='dashed', alpha=.5)  
+ 
+```
+
+
+KM overall 
+```{r}
+ts_pol <- ts_status %>% 
+  mutate(
+    policy_tx = case_when(
+        policy=="Pre" & tx_obs_flag==1 ~ "Pre-policy Tx",
+        policy=="Pre" & tx_obs_flag==0 ~ "Pre-policy Waitlist",
+        policy=="Post" & tx_obs_flag==1 ~ "Post-policy Tx",
+        policy=="Post" & tx_obs_flag==0 ~ "Post-policy Waitlist")
+  )
+
+ts_pol_oneobs <- ts_pol[order(min_ts_status$last_ob, decreasing=TRUE),] 
+ts_pol_oneobs <- ts_pol_oneobs[!duplicated(ts_pol_oneobs$PX_ID),] 
+
+km_fit_overall <- survfit(Surv(fin_time, dead) ~ policy_group, data=ts_pol_oneobs)
+
+test<-ggsurvplot(
+  fit = km_fit_overall, 
+  xlim=c(0,1460),
+  xlab = "Days",
+  ylab = "Overall Survival Probability",
+  #title = "Kaplan-Meier Plot of Overall Survival Probability",
+  pval = TRUE, 
+  conf.int = TRUE, 
+  ylim = c(0.5,1.00), #include for figure production but can't generate p-value if ylim used
+  break.time.by=200,
+  legend = "right",
+  censor=FALSE,
+  risk.table=TRUE,
+  risk.table.height=0.3,
+  risk.table.fontsize=3.5,
+  legend.labs=c("Pre-policy", "Post-policy"),
+  legend.title="",
+  palette="jama")
+  
+test$plot + 
+  geom_vline(xintercept=365, color='grey', linetype='dashed', alpha=.5) +
+  geom_vline(xintercept=730, color='grey', linetype='dashed', alpha=.5) + 
+  geom_vline(xintercept=1095, color='grey', linetype='dashed', alpha=.5)
+
+sum_kmfit_overall <- summary(km_fit_overall, times=1095)
+
+#log-rank test for statistical significance
+survdiff_mh <- survdiff(Surv(fin_time, dead) ~ policy_group, data=ts_pol_oneobs, rho=0)
+survdiff_pp <- survdiff(Surv(fin_time, dead) ~ policy_group, data=ts_pol_oneobs, rho=1)
+survdiff_mh #when rho = 0 this is the log-rank or Mantel-Haenszel test 
+survdiff_pp #when rho = 1 this is the Peto and Peto modification of the Gehan-Wilcoxon test
+
+#p-value using method outlined on line 493
+t_pre_post <- (sum_kmfit_overall$surv[2] - sum_kmfit_overall$surv[1])/(sqrt((sum_kmfit_overall$std.err[2])^2 + (sum_kmfit_overall$std.err[1])^2))
+#p-value from t-score
+p_pre_post <- 2*pt(t_pre_post, df=(7306-2), lower.tail=FALSE)
+
+p_surv_km_pre <- sum_kmfit_overall$surv[1] *100
+p_surv_km_post <- sum_kmfit_overall$surv[2] *100
+se_surv_km_pre <- sum_kmfit_overall$std.err[1] *100
+se_surv_km_post <- sum_kmfit_overall$std.err[2] *100
+
+```
+
+Average time to TX by status and overall
+```{r}
+#time to tx with error bars
+time_to_tx <-  min_ts_status %>%
+  filter(tx_obs_flag==1)  
+
+#barchart of time to tx with SE bars
+data_summary <-function(data, varname, groupnames){
+  require(plyr)
+  summary_func <-function(x,col){
+    c(mean=mean(x[[col]],na.rm=TRUE),
+      sd=sd(x[[col]],na.rm=TRUE),
+      se=(sd(x[[col]])/sqrt(length(x[[col]]))))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func, varname)
+  data_sum<-rename(data_sum, c("mean"=varname))
+  return(data_sum)
+}
+time_to_tx_se_pol <- data_summary(time_to_tx, varname="t_1", groupnames="policy")
+time_to_tx_se_status <- data_summary(time_to_tx, varname="t_1", groupnames="first_status_def")
+
+
+time_to_tx_se_pol <- time_to_tx_se_pol %>% 
+  mutate(t_1 = round(t_1, digits=2))
+time_to_tx_se_status <- time_to_tx_se_status %>% 
+  mutate(t_1 = round(t_1, digits=2))
+ 
+timeplot1 <- ggplot(time_to_tx_se_pol, aes(x=factor(policy), y=t_1)) +
+  geom_bar(stat="identity", position=position_dodge()) + 
+  geom_errorbar(aes(ymin=t_1-se, ymax=t_1+se), width=.2, position=position_dodge(.9)) +
+  theme(legend.position="bottom", plot.title=element_text(hjust=0.5)) +
+  geom_text(aes(label=t_1), color="white", vjust=4.5, position=position_dodge(.9)) + 
+  xlab("") + ylab("Days") + 
+  scale_fill_jama() + 
+  ylim(0,250) + 
+  scale_x_discrete(limits=c("Pre","Post"))
+
+timeplot2 <- ggplot(time_to_tx_se_status, aes(x=factor(first_status_def), y=t_1)) +
+  geom_bar(stat="identity", position=position_dodge()) + 
+  geom_errorbar(aes(ymin=t_1-se, ymax=t_1+se), width=.2, position=position_dodge(.9)) +
+  theme(legend.position="bottom", plot.title=element_text(hjust=0.5), axis.text.x = element_text(angle = 45, hjust = 1))   +
+  geom_text(aes(label=t_1), color="black", vjust=-2, position=position_dodge(.9)) +
+  xlab("") + ylab("") + 
+  scale_fill_jama() + 
+  ylim(0,350) + 
+  scale_x_discrete(limits=c("Status 1A","Status 1B","Status 2 (3-tier)", "Status 1", "Status 2", "Status 3", "Status 4", "Status 5", "Status 6"))
+
+grid.arrange(timeplot1, timeplot2, nrow=1, widths=c(1.2,3.0), top="Average Time to Transplantation by Policy Period and Candidate Status") 
+
+# Extract data for each group
+group_1 <- time_to_tx$t_1[time_to_tx$first_status_def == "Status 3"]
+group_2 <- time_to_tx$t_1[time_to_tx$first_status_def == "Status 1A"]
+# Perform a two-sample t-test
+t_test <- t.test(group_1, group_2)
+# Extract the p-value
+p_value <- t_test$p.value
+```
+
+Number of Tx by status and overall
+```{r}
+#number of transplants and listing by policy  
+num_can <- min_ts_status %>% 
+  distinct(PX_ID, policy) %>% 
+  group_by(policy) %>% 
+  tally() %>% 
+  mutate(legend ="listed") 
+num_tx <- min_ts_status %>%
+  filter(tx_obs_flag ==1) %>% 
+  group_by(policy) %>%
+  tally() %>% 
+  mutate(legend = "transplant") 
+num_total <- rbind(num_tx, num_can) 
+
+numtx1 <- ggplot(num_total, aes(fill=legend, x=factor(policy), y=n)) +
+  geom_bar(stat="identity", position="dodge") + 
+  theme(legend.position="bottom") + 
+  guides(fill=guide_legend(title=NULL)) + 
+  xlab("") + ylab("Candidates") + 
+  scale_fill_jama() + 
+  scale_x_discrete(limits=c("Pre","Post")) 
+#two-proportions z-test 
+z_test <- prop.test(x = c(8941, 7165), n = c(12021, 11022), correct=FALSE)
+z_test 
+
+#number of transplants and listing by status  
+num_can <- min_ts_status %>% 
+  distinct(PX_ID, first_status_def, policy) %>% 
+  group_by(first_status_def, policy) %>% 
+  tally() %>% 
+  mutate(n_can = n, 
+         legend ="listed") 
+num_tx <- min_ts_status %>%
+  filter(tx_obs_flag ==1) %>% 
+  group_by(first_status_def, policy) %>%
+  tally() %>% 
+  mutate(n_tx = n, 
+         legend = "transplant") 
+num_total <- rbind(num_can, num_tx) 
+
+#number of transplants by status at time of transplant 
+num_tx <- min_ts_status %>%
+  filter(tx_obs_flag ==1) %>% 
+  group_by(clean_status, policy) %>%
+  tally()
+
+  
+numtx2 <- ggplot(num_total, aes(fill=legend, x=factor(first_status_def), y=n)) +
+  geom_bar(stat="identity", position="dodge") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position="none") +
+  xlab("") + ylab("") + 
+  scale_fill_jama() + 
+  scale_x_discrete(limits=c("Status 1A","Status 1B","Status 2 (3-tier)", "Status 1", "Status 2", "Status 3", "Status 4", "Status 5", "Status 6"))
+
+grid.arrange(numtx1, numtx2, nrow=1, widths=c(1.3,3.0), top="Number of Candidates by Policy Period and Status") 
+
+
+#% of transplants and listing by policy (clearance rate)
+num_can <- min_ts_status %>% 
+  distinct(PX_ID, policy) %>% 
+  group_by(policy) %>% 
+  tally() %>% 
+  mutate(legend ="listed",
+         n_can = n) 
+num_tx <- min_ts_status %>%
+  filter(tx_obs_flag ==1) %>% 
+  group_by(policy) %>%
+  tally() %>% 
+  mutate(legend = "transplant",
+         n_tx = n) 
+num_total <- num_can %>% left_join(num_tx %>% select(policy, n_tx),
+    by = "policy") %>% 
+  mutate( pct_tx = round((100*n_tx/n_can), digits=2)) 
+
+pcttx1 <- ggplot(num_total, aes(x=factor(policy), y=pct_tx)) +
+  geom_bar(stat="identity") + 
+  theme(legend.position="bottom") + 
+  guides(fill=guide_legend(title=NULL)) + 
+  xlab("") + ylab("Percent Candidates (%)") + 
+  ylim(0,100) + 
+  geom_text(aes(label=pct_tx), color="white", vjust=4, position=position_dodge(.9)) +
+  scale_fill_jama() + 
+  scale_x_discrete(limits=c("Pre","Post")) 
+
+num_can <- min_ts_status %>% 
+  distinct(PX_ID, first_status_def, policy) %>% 
+  group_by(first_status_def, policy) %>% 
+  tally() %>% 
+  mutate(legend ="listed",
+         n_can = n) 
+num_tx <- min_ts_status %>%
+  filter(tx_obs_flag ==1) %>% 
+  group_by(first_status_def, policy) %>%
+  tally() %>% 
+  mutate(legend = "transplant",
+         n_tx = n) 
+num_total <- num_can %>% left_join(num_tx %>% select(policy, first_status_def, n_tx),
+    by = c("policy", "first_status_def")) %>% 
+  mutate( pct_tx = round((100*n_tx/n_can), digits=2))
+
+pcttx2 <- ggplot(num_total, aes(x=factor(first_status_def), y=pct_tx)) +
+  geom_bar(stat="identity") + 
+  theme(legend.position="bottom") + 
+  guides(fill=guide_legend(title=NULL)) + 
+  xlab("") + ylab("") + 
+  ylim(0,100) + 
+  geom_text(aes(label=pct_tx), color="white", vjust=2, position=position_dodge(.9)) +
+  theme(legend.position="bottom", plot.title=element_text(hjust=0.5), axis.text.x = element_text(angle = 45, hjust = 1))   +
+  scale_fill_jama() + 
+  scale_x_discrete(limits=c("Status 1A","Status 1B","Status 2 (3-tier)", "Status 1", "Status 2", "Status 3", "Status 4", "Status 5", "Status 6"))
+
+grid.arrange(pcttx1, pcttx2, nrow=1, widths=c(1.2,3.0), top="Percent of Candidates Transplanted by Policy Period and Status") 
+
+
+```
+
+Cox Proportional Hazard Model
+```{r}
+
+library(epimisc)
+#statistical significance for HR (lincomR from epimisc)
+lincom_1A <- lincomR(coxph_status, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,0,0,0,0,0,0,0,0,0,0), conflev = 0.95, digits = 3)
+lincom_1 <- lincomR(coxph_status, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,0,0,0,0,0,0,0,0,0,0), conflev = 0.95, digits = 3)
+lincom_2 <- lincomR(coxph_status, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,0,0,0,0,0,0,0,0,0,0), conflev = 0.95, digits = 3)
+lincom_3 <- lincomR(coxph_status, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,0,0,0,0,0,0,0,0,0,0), conflev = 0.95, digits = 3)
+#default CI = 0.95
+detach(package:epimisc)
+
+#statistical significance comparing HRa to HRb 
+#se(HRa-HRb) ... Var(A-B) = Var(A) + Var(B) - 2*Cov(A, B). 
+#Cov(HR1A, HR2) = 0, as they are estimated from different models and assumed to be independent. So t statistic for 1A vs. 2 is: (0.289 - 0.264)/sqrt(0.035^2 + 0.050^2) = 0.409616
+t_hr1a_hr1 <- abs((lincom_1A$exp.est - lincom_1$exp.est)/(sqrt((lincom_1A$se.exp.est)^2 + (lincom_1$se.exp.est)^2)))
+t_hr1a_hr2 <- abs((lincom_1A$exp.est - lincom_2$exp.est)/(sqrt((lincom_1A$se.exp.est)^2 + (lincom_2$se.exp.est)^2)))
+#p-value from t-score 
+p_hr1a_hr1 <- 2*pt(t_hr1a_hr1, df=(7221-2), lower.tail=FALSE)
+p_hr1a_hr2 <- 2*pt(t_hr1a_hr2, df=(7221-2), lower.tail=FALSE)
+
+#standard error of HRa-HRb estimate
+se_hr1a_hr1 <- (lincom_1A$se.exp.est - lincom_1$se.exp.est)
+se_hr1a_hr2 <- (lincom_1A$se.exp.est - lincom_2$se.exp.est)
+```
+
+Table 1
+```{r table 1}
+
+for_table_one <- min_ts_status %>% 
+  distinct(PX_ID, tx_obs_flag, policy_group, first_status_def, clean_status, last_ob, dead, fin_time) %>%
+  filter(last_ob==1) %>%
+  left_join(cand_thor, by = "PX_ID")
+
+for_table_one <- for_table_one %>% 
+  mutate(CAN_BMI = if_else(CAN_BMI > 100, 24, CAN_BMI),
+         CAN_HGT_CM = case_when(CAN_HGT_CM == 1.90 ~ 190,
+                                CAN_HGT_CM == 1.70 ~ 170,
+                                CAN_HGT_CM < 20 ~ 170,
+                                TRUE ~ CAN_HGT_CM)
+         ) 
+
+for_table_one <- for_table_one %>%
+  select(
+    CAN_AGE_AT_LISTING,
+    CAN_GENDER,
+    CAN_BMI,
+    CAN_RACE,
+    CAN_DGN,
+    CAN_ABO,
+    CAN_DIAB_TY,
+    CAN_MOST_RECENT_CREAT,
+    CAN_DIAL,
+    CAN_FUNCTN_STAT,
+    CAN_PCW_MEAN,
+    CAN_PULM_ART_MEAN,
+    CAN_CARDIAC_OUTPUT,
+    CAN_WGT_KG,
+    CAN_HGT_CM,
+    CAN_PRIMARY_PAY,
+    CAN_DIAL,
+    CAN_VENTILATOR,
+    tx_obs_flag,
+    policy_group, 
+    first_status_def,
+    clean_status,
+    dead,
+    fin_time) %>%
+   mutate(
+     Transplant = ifelse(tx_obs_flag==1, "transplant", "none"),
+     Gender = factor(CAN_GENDER, levels = c("F", "M")),
+     Race = case_when(CAN_RACE==8 ~ "White",
+                          CAN_RACE==16 ~ "Black",
+                          CAN_RACE==2000 ~ "Hispanic", 
+                          TRUE ~ "Other"),
+        Diagnosis = case_when(
+          CAN_DGN>999 & CAN_DGN<1007 ~ "Dilated cardiomyopathy, non-ischemic",
+          CAN_DGN == 1007 | CAN_DGN ==1200 ~ "Ischemic cardiomyopathy",
+          CAN_DGN>1048 & CAN_DGN< 1100 ~ "Restrictive cardiomyopathy",
+          TRUE ~ "Other"
+        ),
+        Diagnosis = factor(Diagnosis, 
+                           levels = c("Dilated cardiomyopathy, non-ischemic", 
+                                      "Ischemic cardiomyopathy", 
+                                      "Restrictive cardiomyopathy", 
+                                      "Other")),
+        Diabetes = case_when(
+          CAN_DIAB_TY>1 & CAN_DIAB_TY<6 ~ "History of DM",
+          CAN_DIAB_TY ==1 ~ "Non-diabetic",
+          TRUE ~ "Unknown"
+        ),
+        female_gfr = if_else(CAN_GENDER == "F", 0.742, 1),
+        black_gfr = if_else(Race == "Black", 1.21, 1),
+eGFR = 175*((CAN_MOST_RECENT_CREAT)^(-1.154))*(CAN_AGE_AT_LISTING^(-0.203))*female_gfr*black_gfr,
+        Renal_Function = case_when(
+          CAN_DIAL == "Y" ~ "Dialysis",
+          eGFR >= 60 ~ "GFR >= 60 ml/min/1.73 m^2",
+          eGFR>= 30 ~ "GFR >= 30 & <60 ml/min/1.73 m^2",
+          eGFR < 30 ~ "GFR < 30 ml/min/1.73 m^2",
+          TRUE ~ "Unknown"
+        ),
+        Renal_Function = if_else(is.na(Renal_Function)==TRUE, "Unknown", Renal_Function),
+        Dialysis = case_when(
+          CAN_DIAL ==1 ~ "No dialysis",
+          CAN_DIAL ==2 ~ "Hemodialysis",
+          CAN_DIAL ==3 ~ "Peritoneal Dialysis",
+          TRUE ~ "Unknown"
+        ),
+        body_surface_area = 0.007184*(CAN_HGT_CM)^(0.725)*CAN_WGT_KG^(0.425),
+        Cardiac_Index = as.numeric(CAN_CARDIAC_OUTPUT/body_surface_area),
+        Functional_Status = case_when(
+          CAN_FUNCTN_STAT == 1 | (CAN_FUNCTN_STAT>2069) ~"Limited Impairment, 10-30%",
+          (CAN_FUNCTN_STAT>2039 & CAN_FUNCTN_STAT<2061) ~ "Moderate Impairment, 40-60%",
+          (CAN_FUNCTN_STAT>2000 & CAN_FUNCTN_STAT<2031) ~ "Severe Impairment, 70-100%",
+          TRUE ~ "Unknown"
+        ),
+        Functional_Status = ifelse(is.na(Functional_Status), "Unknown", Functional_Status),
+        severe_impairment = ifelse(Functional_Status == "Severe Impairment, 70-100%", 1, 0),
+        pcwp_15 = ifelse(CAN_PCW_MEAN < 15, 1, 0),
+        pcwp_15 = ifelse(is.na(CAN_PCW_MEAN), 0, pcwp_15),
+         blood_type = factor(
+           case_when(
+             CAN_ABO %in% c("A", "A1", "A2") ~ "A",
+             CAN_ABO %in% c("A1B", "A2B") ~ "AB",
+             TRUE ~ CAN_ABO)
+           ),
+        payor = case_when(
+          CAN_PRIMARY_PAY %in% c(3,4,13) ~ "Medicare",
+          CAN_PRIMARY_PAY ==2 ~ "Medicaid",
+          CAN_PRIMARY_PAY == 1 ~ "Private",
+          TRUE ~ "Other"
+        )
+  )
+
+#by policy group and tx
+library(tableone)
+cont_vars <- c("CAN_AGE_AT_LISTING", "CAN_BMI", 
+               "CAN_PULM_ART_MEAN", "CAN_PCW_MEAN", "Cardiac_Index")
+cat_vars <- c( "Gender","Race", "Transplant", "first_status_def",
+               "Diagnosis", "Diabetes", "Dialysis", "Renal_Function", "CAN_VENTILATOR",
+               "Functional_Status","severe_impairment", "pcwp_15", "blood_type", "payor")
+
+cat_vars_ <- print(CreateCatTable(vars = cat_vars, data = for_table_one, strata ="policy_group"))
+write.csv(cat_vars_, "cat_vars_pol.csv")
+cont_vars_ <- print(CreateContTable(vars = cont_vars, data = for_table_one, strata="policy_group"))
+write.csv(cont_vars_, "cont_vars_pol.csv")
+
+
+```
+
+Table 2 
+```{r table 2}
+#by status and tx
+
+check_cardiac_output<- for_table_one %>% 
+  select(first_status_def, tx_obs_flag, Cardiac_Index, CAN_CARDIAC_OUTPUT, CAN_HGT_CM, CAN_WGT_KG) 
+
+
+test <- for_table_one %>% 
+  filter(clean_status==2010 | clean_status==2130) %>%
+  filter(tx_obs_flag==1)
+
+
+cont_vars <- c("CAN_AGE_AT_LISTING", "CAN_BMI", 
+               "CAN_PULM_ART_MEAN", "CAN_PCW_MEAN", "Cardiac_Index")
+cat_vars <- c( "Gender","Race", 
+               "Diagnosis", "Diabetes", "Dialysis", "Renal_Function", "CAN_VENTILATOR",
+               "Functional_Status","severe_impairment", "pcwp_15", "blood_type", "payor")
+
+cat_vars_by_tx <- print(CreateCatTable(vars = cat_vars, data = test, strata = c("clean_status")))
+write.csv(cat_vars_by_tx, "cat_vars_by_tx_status.csv")
+cont_vars_by_tx <- print(CreateContTable(vars = cont_vars, data = test, strata = c("clean_status")))
+write.csv(cont_vars_by_tx, "cont_vars_by_tx_status.csv")
+
+
+```
+
+
+Appendixes 
+
+Check Model Assumptions
+```{r}
+#check proportional hazards assumptions
+cz <- cox.zph(coxph_status)
+print(cz)
+
+#tx_obs_flag
+plot(cz[1])
+abline(h=0, col=2)
+abline(h=coxph_status$coef[1], col=3)
+#status_1A
+plot(cz[2])
+abline(h=0, col=2)
+abline(h=coxph_status$coef[2], col=3)
+#status1
+plot(cz[3])
+abline(h=0, col=2)
+abline(h=coxph_status$coef[4], col=3)
+#status2
+plot(cz[4])
+abline(h=0, col=2)
+abline(h=coxph_status$coef[5], col=3)
+
+#check linearity
+plot(predict(coxph_status),residuals(coxph_status,type="martingale"),
+     las=1)
+abline(h=0)
+```
+
+
+Table 1 Donor Characteristics
+```{r table 1}
+
+for_table_one_donor <- min_ts_status %>% 
+  distinct(PX_ID, to_tx, tx_obs_flag, policy_group, first_status_def, clean_status, last_ob, dead, fin_time) %>%
+  filter(tx_obs_flag==1) %>%
+  left_join(tx_hr, by = "PX_ID") %>%
+  select(
+    DON_AGE,
+    DON_ABO,
+    DON_GENDER,
+    DON_RACE,
+    DON_CREAT,
+    DON_HIGH_CREAT,
+    DON_HIST_DIAB,
+    DON_HTN,
+    DON_WARM_ISCH_TM_MINS,
+    REC_HR_ISCH,
+    DON_HIST_CIGARETTE_GT20_PKYR,
+    DON_HIST_COCAINE,
+    policy_group
+  ) %>%
+  mutate(
+    Gender = factor(DON_GENDER, levels = c("F", "M")),
+    Race = case_when(DON_RACE==8 ~ "White",
+                          DON_RACE==16 ~ "Black",
+                          DON_RACE==2000 ~ "Hispanic", 
+                          TRUE ~ "Other"),
+    creatinine = DON_CREAT,
+    high_cr = case_when(DON_HIGH_CREAT==1 ~ ">1.5",
+                        DON_HIGH_CREAT==0 ~ "<1.5"),
+    Diabetes = case_when(DON_HIST_DIAB>1 & DON_HIST_DIAB<6 ~ "History of DM",
+                         DON_HIST_DIAB==1 ~ "Non-diabetic",
+                         TRUE ~ "Unknown"),
+    Hypertension = case_when(DON_HTN==1 ~ "History of HTN",
+                             DON_HTN==0 ~ "Non-hypertensive",
+                             TRUE ~ "Unknown"),
+    ischemic_time_warm = DON_WARM_ISCH_TM_MINS,
+    ischemic_time = REC_HR_ISCH,
+    blood_type = factor(
+           case_when(
+             DON_ABO %in% c("A", "A1", "A2") ~ "A",
+             DON_ABO %in% c("A1B", "A2B") ~ "AB",
+             TRUE ~ DON_ABO)),
+    packyear_20 = case_when(DON_HIST_CIGARETTE_GT20_PKYR =="N" ~ "No",
+                 DON_HIST_CIGARETTE_GT20_PKYR =="Y" ~ "Yes",
+                 TRUE ~ "Unknown"),
+    cocaine = case_when(DON_HIST_COCAINE =="N" ~ "No",
+                 DON_HIST_COCAINE =="Y" ~ "Yes",
+                 TRUE ~ "Unknown"),
+    ) %>%
+  select(-DON_GENDER, -DON_RACE, -DON_ABO, -DON_CREAT, -DON_HIGH_CREAT, -DON_HIST_DIAB, -DON_HTN, -DON_WARM_ISCH_TM_MINS, -DON_HIST_CIGARETTE_GT20_PKYR, -DON_HIST_COCAINE, -REC_HR_ISCH)
+  
+
+library(tableone)
+cont_vars <- c("DON_AGE", "creatinine", "ischemic_time", "ischemic_time_warm") 
+cat_vars <- c( "Gender","Race", "high_cr", "Diabetes", "Hypertension", "blood_type", "packyear_20", "cocaine")
+
+donor_cat_vars_by_pol <- print(CreateCatTable(vars = cat_vars, data = for_table_one_donor, strata ="policy_group"))
+donor_cont_vars_by_pol <- print(CreateContTable(vars = cont_vars, data = for_table_one_donor, strata="policy_group"))
+
+write.csv(donor_cont_vars_by_pol, "donor_cont_vars_by_pol.csv")
+write.csv(donor_cat_vars_by_pol, "donor_cat_vars_by_pol.csv")
+
+```
+

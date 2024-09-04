@@ -1,0 +1,427 @@
+---
+title: "Data Prep"
+output: pdf_document
+---
+
+
+```{r setup, include = FALSE}
+rm(list = ls())
+
+knitr::opts_chunk$set(echo=TRUE,warning=FALSE,message=FALSE)
+require("knitr")
+
+#set global options for this rmarkdown document
+opts_chunk$set(cache = TRUE, warning=FALSE, message=FALSE, tidy.opts=list(width.cutoff=60))
+```
+
+
+Install Packages
+```{r packages, warning=FALSE, message=FALSE, cache = FALSE}
+
+#packages used
+library(haven) #for reading SAS
+library(tidyverse) #so that you don't have do code in Base R
+library(zoo) #https://cran.r-project.org/web/packages/zoo/index.html
+library(rmdformats) #for knitting your rmd into html
+library(dplyr) #dplyr lives in tidyverse
+```
+
+Read in Raw Data
+```{r read_in_SAS}
+# read in the SRTR SAF files
+cand_thor <- read_sas("cand_thor.sas7bdat", NULL) %>%  
+  zap_formats() %>% zap_labels()
+
+tx_hr <- read_sas("tx_hr.sas7bdat", NULL) %>%  
+  zap_formats() %>% zap_labels()
+
+stathist_thor <- read_sas("stathist_thor.sas7bdat", NULL) %>%  
+  zap_formats() %>% zap_labels()
+```
+
+Create Cohorts
+```{r data_range_select, echo=TRUE, message=FALSE, warning=FALSE}
+#pre-policy start and stop time
+start_date <- as.Date("2013-10-18")
+pre_policy_end_date <- as.Date("2016-10-18")
+#post-policy start and stop time
+post_policy_start_date <- as.Date("2018-10-18")
+end_date <- as.Date("2021-10-18")
+#policy switch date
+policy_switch_date <- as.Date("2018-10-18")
+  
+#inclusion and exclusion criteria 
+init_list <- cand_thor %>% 
+  mutate(list_date=CAN_LISTING_DT,
+         rem_date=CAN_REM_DT,
+         tx_date=REC_TX_DT,
+         last_act_date=CAN_LAST_ACT_STAT_DT,
+         init_status = CAN_INIT_STAT,
+         center_id = CAN_LISTING_CTR_CD) %>% 
+  mutate(list_year = format(list_date, "%Y")) %>%
+  filter(WL_ORG =="HR") %>%
+  filter(CAN_LISTING_CTR_CD !="") %>%
+  filter(list_date >= start_date & list_date <= end_date)  %>% 
+  mutate(policy = case_when(
+    list_date <= pre_policy_end_date ~ paste0("Pre"),
+    list_date >= post_policy_start_date ~  paste0("Post"),
+    list_date > pre_policy_end_date & list_date < post_policy_start_date ~paste0("in-between"),
+    TRUE ~ paste0("ERROR"))) %>% 
+  filter(policy !="in-between") %>%
+  filter(CAN_AGE_AT_LISTING >=18) %>%
+  select(
+    PX_ID, CAN_REM_CD, CAN_LISTING_CTR_CD, CAN_REM_DT, PERS_OPTN_DEATH_DT, PERS_SSA_DEATH_DT, REC_TX_DT, CAN_INIT_STAT, CAN_FUNCTN_STAT, CAN_BMI, list_date, list_year, policy, rem_date, tx_date, last_act_date, init_status, center_id 
+  )
+
+flow_1_start <- as.numeric(nrow(distinct(init_list, PX_ID)))
+
+
+#remove candidates listed at low volume centers (2 per year)
+min_tx <- 12
+init_list <- init_list %>% 
+  mutate(transplant = ifelse(CAN_REM_CD == 4, 1, 0)) %>%
+	group_by(center_id) %>% 
+  mutate(tot_tx = sum(transplant, na.rm = TRUE)) %>% 
+  ungroup() 
+init_list <- init_list %>% filter(tot_tx>=min_tx)  
+
+flow_2_low_volume_centers <- (flow_1_start) - as.numeric(nrow(init_list))
+
+#DELETE
+hist_center <- distinct(init_list, center_id, tot_tx, count=1, .keep_all=FALSE)
+hist(hist_center$tot_tx,
+     main="Distribution of Centers by Number of Transplantations Performed",
+     xlab="Number of Transplants Performed",
+     xlim=c(0,600),
+     breaks=30)
+#Test distribution of tx and list dates - DELETE
+ggplot(init_list, aes(x=tx_date, y=list_date, color=policy)) + geom_point() + xlab("Tx Date") + ylab("List Date") + theme(legend.position="none") 
+```
+
+
+Identify last observation date for each candidate
+```{r death_date_consolidation, warning=FALSE, message=FALSE}
+#link to transplant record and identify last observation date (death, re-transplant, or last follow-up)
+#CAN_REM_CD 8 = Died; 21 = Patient died during TX procedure
+#TFL_LASTATUS D = Dead; R = Retransplanted
+init_list <- init_list %>% left_join(tx_hr %>% select(PX_ID, TFL_LASTATUS, TFL_DEATH_DT, TFL_LAFUDATE, REC_OPO_ID),
+    by = "PX_ID") %>% 
+  mutate(to_die = case_when(
+      CAN_REM_CD %in% c(8,21)==TRUE ~1, 
+      TFL_LASTATUS %in% c("D", "R") ==TRUE ~1, 
+      is.na(PERS_OPTN_DEATH_DT) == FALSE ~1, 
+      is.na(PERS_SSA_DEATH_DT) == FALSE ~1, 
+      TRUE ~0
+  ),
+  to_tx = case_when(is.na(REC_TX_DT) == FALSE ~1, TRUE ~0),
+  #these become redundant later since we administratively censor (could delete)
+  lafu_date = TFL_LAFUDATE,
+  dead_date = case_when(
+        is.na(PERS_OPTN_DEATH_DT) == FALSE ~ PERS_OPTN_DEATH_DT,
+        TRUE ~ PERS_SSA_DEATH_DT),
+  rem_date = CAN_REM_DT,
+
+  final_date = case_when(
+      is.na(dead_date) == FALSE ~ dead_date,
+      is.na(lafu_date) == FALSE ~ lafu_date,
+      is.na(rem_date) == FALSE ~ rem_date,
+      TRUE ~ last_act_date),
+  time = as.numeric(final_date-list_date)
+  ) 
+
+#DELETE
+ggplot(init_list, aes(x=list_date, y=tx_date, color=final_date)) + geom_point() + xlab("List Date") + ylab("Tx Date") + theme(legend.position="none") + theme(legend.position="right")
+```
+
+# Merge data sets to create time series
+Filter status history file and select key variables
+```{r select_historys, echo = TRUE }
+hist <-stathist_thor %>% filter(PX_ID %in% init_list$PX_ID) %>% 
+	mutate(date_start = CANHX_BEGIN_DT, 
+	       date_end = CANHX_END_DT, 
+	       status = CANHX_STAT_CD, 
+	       real_status = CANHX_STAT_CD, 
+	       rem_dt = CAN_REM_DT) %>% 
+	arrange(PX_ID, date_start) %>% 
+  select(PX_ID, status, real_status, date_start, date_end, rem_dt,  CAN_REM_CD)
+
+```
+
+Merge data sets to create time series
+```{r create_cand_time_series, message = FALSE, warning = FALSE }
+#prepare init_hist for merging
+init_list <- init_list %>% mutate(status = CAN_INIT_STAT, 
+        date_start = list_date)
+
+#merge with history 
+cand_time_series <- init_list %>% 
+  mutate(int_form =1) %>% 
+  full_join(hist, c("PX_ID", "date_start", "status"), suffix = c(".init", ".hist")) %>% 
+  mutate(rem_cd = CAN_REM_CD.hist) %>%
+  arrange(PX_ID, date_start)
+
+```
+
+
+Add transplant files to time series
+```{r add_tx,  message = FALSE, warning = FALSE}
+
+cand_time_series <- cand_time_series %>% 
+  mutate(date = date_start,
+         tfl_last = TFL_LASTATUS)
+
+tx <- tx_hr %>% filter(PX_ID %in% init_list$PX_ID) %>% 
+  mutate(date = REC_TX_DT, status=CAN_INIT_STAT, tx_obs =1) %>%
+  select(PX_ID, date, status, tx_obs)
+
+time_series <- cand_time_series %>% 
+  full_join(tx, by = c("PX_ID", "date", "status"), suffix = c(".cand", ".tx")) %>% 
+  arrange(PX_ID, date) %>%
+  mutate(int_obs_flag = case_when(int_form==1 ~1, 
+                                  is.na(int_form) == TRUE ~0)) 
+
+#carryforward key dates and death status
+time_series <- time_series %>% ungroup() %>% 
+  arrange(PX_ID, date) %>% 
+  group_by(PX_ID) %>% 
+  mutate(
+    center_id = na.locf(center_id, na.rm=FALSE),
+    to_tx = na.locf(to_tx, na.rm = FALSE), 
+  	to_die = na.locf(to_die, na.rm = FALSE),
+    final_date = na.locf(final_date, na.rm = FALSE),
+    list_date = na.locf(list_date, na.rm = FALSE),
+    policy = na.locf(policy, na.rm=FALSE),
+    time = na.locf(time, na.rm=FALSE),
+    tx_date = na.locf(tx_date, na.rm = FALSE),
+    dead_date = na.locf(dead_date, na.rm = FALSE),
+    lafu_date = na.locf(lafu_date, na.rm = FALSE),
+    rem_date = na.locf(rem_date, na.rm = FALSE), 
+    rem_cd = na.locf(rem_cd, na.rm = FALSE),
+    last_act_date = na.locf(last_act_date, na.rm = FALSE),
+    CAN_LISTING_CTR_CD = na.locf(CAN_LISTING_CTR_CD, na.rm = FALSE)
+
+  )
+    
+```
+
+Create Cleaned Status Variable
+```{r create_clean_status,  message = FALSE, warning = FALSE}
+
+#carryforward "clean status" status history dataset for missing Tx status and for inactive status 
+time_series <- time_series %>%   ungroup() %>% arrange(PX_ID, date_start) %>%
+  group_by(PX_ID) %>% 
+  mutate(check_int_inac = case_when(int_obs_flag==1 & status==2999 ~ 1, TRUE ~ 0)) %>%
+  filter(check_int_inac==0) %>% 
+  mutate(clean_status = case_when(real_status==2999 ~ lag(real_status), TRUE ~ real_status))%>% 
+  mutate(clean_status = case_when(int_obs_flag==0 ~ na.locf(clean_status, na.rm = FALSE), 
+                                  TRUE ~ clean_status)) %>% 
+  mutate(check_na = if_else(is.na(clean_status)==TRUE,1,0)) %>% 
+  filter(check_na != 1) %>% 
+  filter(clean_status !=2999) %>% 
+  ungroup()
+
+flow_3_inactive <- (flow_1_start - flow_2_low_volume_centers) - as.numeric( nrow( distinct( time_series, PX_ID)))
+
+```
+
+Convert dates to start/stop time in days variables
+```{r last_ob, echo = TRUE }
+
+#create flag variables
+ts <- time_series %>%
+  ungroup() %>% 
+  mutate(
+    tx_obs_flag = case_when(tx_obs==1 ~ 1,
+      is.na(tx_obs) == TRUE ~0),
+    int_obs_flag = case_when(int_form==1 ~1,
+      is.na(int_form) == TRUE ~0)
+    ) %>%
+  group_by(PX_ID) %>% 
+    mutate(first_ob = if_else(row_number()==1, 1, 0)) %>% 
+  ungroup()
+
+#create functional status variables and policy binary
+ts <- ts %>% 
+  group_by(PX_ID) %>%
+          mutate(status_def = case_when(
+            clean_status == 2010 ~ "Status 1A",
+            clean_status == 2020 ~ "Status 1B",
+            clean_status == 2030 ~ "Status 2",
+            clean_status == 2999 ~ "Temporarily inactive",
+            clean_status == 2110 ~ "Status 1",
+            clean_status == 2120 ~ "Status 2",
+            clean_status == 2130 ~ "Status 3",
+            clean_status == 2140 ~ "Status 4",
+            clean_status == 2150 ~ "Status 5",
+            clean_status == 2160 ~ "Status 6"
+          )
+          ) %>%
+      ungroup() %>% 
+  mutate(policy_group = if_else(policy=="Post",1,0)) 
+
+```
+
+Start and stop dates for tx events
+```{r Create start and stop dates}
+  ts <- ts %>% 
+  mutate(
+    date_start = case_when(
+      is.na(date_start) == FALSE ~ date_start,
+      TRUE ~ tx_date),
+    date_end = case_when(
+      is.na(date_end) == FALSE ~ date_end,
+      TRUE ~ final_date)
+  )
+```
+
+
+Administratively censor at end of follow-up periods. 
+```{r Administratively Censor}
+
+end_fu_pre <- as.Date("2018-10-18")
+end_fu_post <- as.Date("2023-10-18")
+
+#TS STATUS ******************************
+#Administratively censor at end of follow-up date
+ts_status <- ts %>% 
+  mutate(
+    censor_flag = case_when(date_start >= end_fu_pre & policy=="Pre" ~ 1,
+                            date_start >= end_fu_post & policy=="Post" ~1,
+                            TRUE ~ 0 )
+    ) %>% 
+  filter(censor_flag !=1) 
+
+
+#count the number of PX_ID that started as a 2999 and then continued into a different period as other statuses - were not censored earlier because they technically did not spend their entire time as 2999
+flow_4_active_other_pol <- (flow_1_start - flow_2_low_volume_centers - flow_3_inactive) - as.numeric( nrow( distinct( ts_status, PX_ID)))
+
+check_status <- ts_status %>% 
+  group_by(policy, clean_status) %>%
+  tally()   
+test <- ts_status %>% select(PX_ID, policy, status, real_status, clean_status, to_tx, tx_obs_flag, tx_obs_flag, date_start, tx_date, date_end, dead_date, rem_date, rem_cd, final_date) %>% filter(policy=="Post" & clean_status==2030)
+
+ts_status <- ts_status %>%  
+  group_by(PX_ID) %>% 
+    mutate(last_ob = if_else(row_number()==n(), 1, 0)) %>% 
+  ungroup() %>%
+    mutate(date_end = if_else(last_ob==1, final_date, date_end ))
+
+ts_status <- ts_status %>% 
+  mutate(
+    fin_date = case_when(date_end > end_fu_pre & policy=="Pre" ~ end_fu_pre,
+                         date_end > end_fu_post & policy=="Post" ~ end_fu_post,
+                         TRUE ~ date_end)
+  )
+
+#Omit remaining mismatch 
+ts_status <- ts_status %>% 
+  mutate(
+    censor = case_when(clean_status==2010 & policy=="Post" ~1, 
+                       clean_status==2020 & policy=="Post" ~1,
+                       clean_status==2030 & policy=="Post" ~1,
+                       TRUE ~ 0 )
+  ) %>% 
+  filter(censor==0)
+#test <- ts_status  %>% distinct(policy, clean_status) 
+
+flow_5_mismatch <- (flow_1_start - flow_2_low_volume_centers - flow_3_inactive - flow_4_active_other_pol) - as.numeric(nrow(distinct(ts_status, PX_ID)))
+
+#DELETE
+ggplot(ts_status, aes(x=list_date, y=date_end)) + geom_point() + xlab("List Date") + ylab("End Date for Given Obs") + theme(legend.position="none") 
+ggplot(ts_status, aes(x=list_date, y=date_start)) + geom_point() + xlab("List Date") + ylab("Start Date for Given Obs") + theme(legend.position="none") 
+ggplot(ts_status, aes(x=list_date, y=fin_date)) + geom_point() + xlab("List Date") + ylab("Fin Date for Given Obs") + theme(legend.position="none") 
+
+```
+
+Make time intervals (t1, t2)
+```{r}
+#create time (days) variable for status time series
+time_func <- function(data_set){
+  ts_holder <- data_set %>% 
+    group_by(PX_ID) %>% 
+  dplyr::mutate(
+    t_1 = as.numeric(date_start-list_date),
+    last_ob = if_else(row_number()==n(), 1, 0),
+    t_2 = ifelse(last_ob ==0, lead(t_1), fin_date - list_date),
+    fin_time = as.numeric(fin_date - list_date)
+) %>% ungroup()
+}
+
+ts_status <- time_func(data_set=ts_status)
+
+#filter out one day periods and erroneous dating 
+#(where listing date is after the death date in social security death master file). 
+
+ts_status <- ts_status %>%
+  filter(t_2 > t_1) %>% 
+  group_by(PX_ID) %>%
+  mutate(last_ob = if_else(row_number()==n(), 1, 0)) %>% 
+  mutate(
+    dead = case_when(last_ob==1 & final_date > end_fu_pre & policy=="Pre" ~ 0,
+                     last_ob==1 & final_date > end_fu_post & policy=="Post" ~ 0, 
+                     last_ob ==1 & to_die ==1 ~1,
+                     TRUE ~ 0 ),
+    last_status = case_when(last_ob==1 ~ clean_status)
+  ) %>% 
+  ungroup()
+
+flow_6_one_day <- (flow_1_start - flow_2_low_volume_centers - flow_3_inactive - flow_4_active_other_pol - flow_5_mismatch) - as.numeric(nrow(distinct(ts_status, PX_ID)))
+
+#create initial status var
+ts_status_firstob <- ts_status %>% 
+  group_by(PX_ID) %>% 
+    mutate(first_ob = if_else(row_number()==1, 1, 0)) %>% 
+  ungroup() %>% 
+  filter(first_ob==1) %>% 
+  mutate(clean_initial_status = clean_status)
+
+ts_status <- ts_status %>% 
+  left_join(ts_status_firstob %>% select(PX_ID, clean_initial_status),
+    by = c("PX_ID")) %>%
+  mutate(first_status_def = case_when(
+            clean_initial_status == 2010 ~ "Status 1A",
+            clean_initial_status == 2020 ~ "Status 1B",
+            clean_initial_status == 2030 ~ "Status 2 (3-tier)",
+            clean_initial_status == 2999 ~ "Temporarily inactive",
+            clean_initial_status == 2110 ~ "Status 1",
+            clean_initial_status == 2120 ~ "Status 2",
+            clean_initial_status == 2130 ~ "Status 3",
+            clean_initial_status == 2140 ~ "Status 4",
+            clean_initial_status == 2150 ~ "Status 5",
+            clean_initial_status == 2160 ~ "Status 6"))
+
+check_status <- ts_status %>% 
+  group_by(policy, clean_status) %>%
+  tally() 
+
+#change erroneous BMI
+outlier_bmi_status <- ts_status %>% 
+  filter(CAN_BMI > 100)
+ts_status <- ts_status %>% 
+  filter(!PX_ID %in% outlier_bmi_status$PX_ID)
+
+flow_7_bmi <- (flow_1_start - flow_2_low_volume_centers - flow_3_inactive - flow_4_active_other_pol - flow_5_mismatch - flow_6_one_day) - as.numeric(nrow(distinct(ts_status, PX_ID)))
+
+#minimal variables needed for analysis
+min_ts_status <- ts_status %>% select(PX_ID, policy, policy_group, to_tx, to_die, first_ob, tx_obs_flag, last_ob, status, clean_status, last_status, dead, list_date, t_1, t_2, date_start, date_end, tx_date, dead_date, lafu_date, rem_date, rem_cd, last_act_date, fin_date, fin_time, final_date, first_status_def, clean_initial_status, tfl_last) %>%
+  group_by(PX_ID) %>% 
+  mutate(last_ob = if_else(row_number()==n(), 1, 0)) %>% 
+  ungroup()
+
+#TESTS********************************************
+ggplot(ts_status, aes(x=list_date, y=fin_date, color=dead)) + geom_point() + xlab("List Date") + ylab("End Date for Given Obs") + theme(legend.position="right") 
+ggplot(ts_status, aes(x=list_date, y=t_2, color=dead)) + geom_point() + xlab("List Date") + ylab("Time to End of Follow-up") + theme(legend.position="right") 
+
+test <- ts_status %>% filter(tx_obs_flag==1) %>% select(PX_ID, policy, list_date, t_1, t_2, tx_obs_flag, date_start, tx_date, date_end, fin_date, dead_date, dead, rem_date, rem_cd, final_date) 
+ggplot(test, aes(x=tx_date, y=t_2-t_1, color=dead)) + geom_point() + xlab("Tx Date") + ylab("Time post Tx") + theme(legend.position="right") 
+# will get more dead = 0 within body of triangles now since no longer assuming that all tx receps survive to end of f/u unless there is an explicit death date 
+ggplot(test, aes(x=tx_date, y=t_1, color=dead)) + geom_point() + xlab("Tx Date") + ylab("Time to Tx") + theme(legend.position="right")
+
+test <- ts_status %>% distinct(PX_ID)
+
+```
+
+Save final datasets 
+```{r save final datasets}
+write.csv(ts_status, "ts_status.csv")
+```

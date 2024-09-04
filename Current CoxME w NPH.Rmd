@@ -1,0 +1,709 @@
+--
+title: "CoxME w NPH"
+author: "Stratton Tolmie"
+output: pdf_document
+---
+
+install
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+rm(list = ls())
+
+library(survival)
+library(survminer)
+library(coxme)
+library(insight)
+library(ggplot2)
+library(tidyverse) 
+library(zoo)
+library(ggsci)
+library(tibble)
+library(gridExtra)
+library(dplyr)
+
+```
+
+```{r Read CSV}
+ts_status <- read.csv("ts_status.csv", row.names=1)
+
+```
+
+
+```{r introduce surv_90 variable ts_status}
+#can move to data preperation file
+
+to_model <- ts_status %>% select(PX_ID, CAN_LISTING_CTR_CD, policy, to_tx, tx_obs_flag, to_die, first_ob, tx_obs_flag, last_ob, status, clean_status, status_def, dead, last_ob, list_date, t_1, t_2, date_start, date_end, tx_date, dead_date, lafu_date, rem_date, rem_cd, last_act_date, fin_date, final_date, , tfl_last, last_ob) %>%
+  mutate(first_tx_ob = 0)
+
+waitlist <- to_model %>% 
+  filter(tx_obs_flag == 0) %>%
+  mutate(tx_first_90 = 0)
+
+first_cut <- 90
+
+first_post_trans_ob <- to_model %>%
+  filter(tx_obs_flag ==1) %>%
+  mutate(t_post_trans = t_2 -t_1,
+         t_2 = ifelse(t_post_trans > first_cut, t_1 + first_cut, t_2),
+         dead = ifelse(t_post_trans > first_cut, 0, dead)) %>%
+  select(-t_post_trans)%>%
+  mutate(tx_first_90 = 1,
+         first_tx_ob = 1)
+
+second_post_trans_ob <- to_model %>%
+  filter(tx_obs_flag ==1) %>% 
+  mutate(t_post_trans = t_2 - t_1) %>% 
+  filter(t_post_trans > first_cut) %>%
+  mutate(t_1 = t_1 + first_cut,
+         tx_first_90=0)%>%
+  select(-t_post_trans)
+
+extended_ts_status <- waitlist %>%
+  rbind(first_post_trans_ob) %>%
+  rbind(second_post_trans_ob) %>%
+  arrange(PX_ID, t_1) 
+
+test <- extended_ts_status %>% select(PX_ID, t_1, t_2, clean_status, tx_obs_flag, first_tx_ob, tx_first_90, dead) 
+#see 1115292 for example (also 1115409)
+
+```
+
+
+```{r prepare data for cox models}
+
+ts_status_code <- extended_ts_status %>% 
+  mutate(
+        status_1A = ifelse(clean_status==2010,1,0),
+        status_1B = ifelse(clean_status==2020,1,0),
+        status_2 = if_else(clean_status==2030,1,0),
+        status1 = if_else(clean_status==2110,1,0),
+        status2 = if_else(clean_status==2120,1,0),
+        status3 = if_else(clean_status==2130,1,0),
+        status4 = if_else(clean_status==2140,1,0),
+        status5 = if_else(clean_status==2150,1,0),
+        status6 = if_else(clean_status==2160,1,0),
+        center = case_when(
+          is.na(CAN_LISTING_CTR_CD) == FALSE ~ CAN_LISTING_CTR_CD),
+        center = na.locf(center))
+
+```
+
+```{r cox model combined}
+coxme_status <- coxme(Surv(t_1,t_2,dead) ~ tx_obs_flag + tx_first_90 + status_1A + status_1B + status1 + status2 + status3 + status4 + status5 + status6 + tx_obs_flag*(status_1A + status_1B + status1 + status2 + status3 + status4 + status5 + status6) + tx_first_90*(status_1A + status_1B + status1 + status2 + status3 + status4 + status5 + status6) + (1 + tx_obs_flag|center), data=ts_status_code)
+
+coxph_status <- coxph(Surv(t_1,t_2,dead) ~ tx_obs_flag + tx_first_90 + status_1A + status_1B + status1 + status2 + status3 + status4 + status5 + status6 + tx_obs_flag*(status_1A + status_1B + status1 + status2 + status3 + status4 + status5 + status6) + tx_first_90*(status_1A + status_1B + status1 + status2 + status3 + status4 + status5 + status6), data=ts_status_code, cluster=center)
+
+print(coxph_status)
+print(coxme_status)
+
+
+#Create output to later merge for survival calculations 
+center_coef <- as.data.frame(coxme_status[["frail"]][["center"]])
+center_coef <- tibble::rownames_to_column(center_coef, "center") %>% 
+  mutate(
+    center = center,
+    rand_intercept = Intercept,
+    rand_tx = tx_obs_flag
+  ) %>%
+  select(center, rand_intercept, rand_tx)
+
+#https://dev.stats.oarc.ucla.edu/r/dae/mixed-effects-cox-regression/
+#https://bookdown.org/steve_midway/DAR/random-effects.html#types-of-models-with-random-effects
+#https://rdrr.io/cran/coxme/f/inst/doc/coxme.pdf
+```
+
+```{r basehaz probability of survival at time t}
+
+tx_df_base <- with(ts_status_code, 
+              data.frame(
+                tx_obs_flag = c(0,1),
+                tx_first_90 = c(0,0),
+                status_1A = c(0,0),
+                status1 = c(0,0),
+                status2 = c(0,0),
+                ## 
+                status_1B = c(0,0),
+                status3 = c(0,0),
+                status4 = c(0,0),
+                status5 = c(0,0),
+                status6 = c(0,0)
+              ))
+
+p_surv <- function (time) {
+  summary(survfit(coxph_status, data=coxph_status, newdata=tx_df_base), times=c(time))$surv[1]
+}
+p_surv_1yr <- p_surv(365)
+p_surv_2yr <- p_surv(730)
+p_surv_3yr <- p_surv(1095)
+p_surv_4yr <- p_surv(1460)
+
+```
+
+```{r dataframe with output from cox models}
+
+ts_tx_code <- ts_status_code %>% 
+  filter(first_tx_ob==1) %>% 
+  select(PX_ID, clean_status, status_def, tx_obs_flag, center, policy, dead, tx_obs_flag, t_1, t_2, 
+         date_start, date_end, fin_date, rem_cd, 
+         status_1A, status_1B, status_2, status1, status2, status3, status4, status6) %>%
+  left_join(center_coef %>% select(center, rand_intercept, rand_tx),  by = "center") %>%
+  #add coef from coxme model 
+  mutate(
+    status_def = case_when(clean_status==2030 ~ paste0("Status 2 (3 tier)"),
+                           TRUE ~ paste0(status_def)),
+    coef_tx = coxme_status$coefficients[1],
+    coef_tx_first_90 = coxme_status$coefficients[2],
+    coef_status = as.numeric(case_when(
+      clean_status==2010 ~ paste0(coxme_status$coefficients[3]),
+      clean_status==2020 ~ paste0(coxme_status$coefficients[4]),
+      clean_status==2030 ~ paste0(1),
+      clean_status==2110 ~ paste0(coxme_status$coefficients[5]),
+      clean_status==2120 ~ paste0(coxme_status$coefficients[6]),
+      clean_status==2130 ~ paste0(coxme_status$coefficients[7]),
+      clean_status==2140 ~ paste0(coxme_status$coefficients[8]),
+      clean_status==2150 ~ paste0(coxme_status$coefficients[9]),
+      clean_status==2160 ~ paste0(coxme_status$coefficients[10]),
+      
+      TRUE ~ paste0(0)
+    )),
+    coef_status_tx = as.numeric(case_when(
+      clean_status==2010 ~ paste0(coxme_status$coefficients[11]),
+      clean_status==2020 ~ paste0(coxme_status$coefficients[12]),
+      clean_status==2030 ~ paste0(1),
+      clean_status==2110 ~ paste0(coxme_status$coefficients[13]),
+      clean_status==2120 ~ paste0(coxme_status$coefficients[14]),
+      clean_status==2130 ~ paste0(coxme_status$coefficients[15]),
+      clean_status==2140 ~ paste0(coxme_status$coefficients[16]),
+      clean_status==2150 ~ paste0(coxme_status$coefficients[17]),
+      clean_status==2160 ~ paste0(coxme_status$coefficients[18]),
+      TRUE ~ paste0(0)
+    )),
+    coef_status_tx_first_90 = as.numeric(case_when(
+      clean_status==2010 ~ paste0(coxme_status$coefficients[19]),
+      clean_status==2020 ~ paste0(coxme_status$coefficients[20]),
+      clean_status==2030 ~ paste0(1),
+      clean_status==2110 ~ paste0(coxme_status$coefficients[21]),
+      clean_status==2120 ~ paste0(coxme_status$coefficients[22]),
+      clean_status==2130 ~ paste0(coxme_status$coefficients[23]),
+      clean_status==2140 ~ paste0(coxme_status$coefficients[24]),
+      clean_status==2150 ~ paste0(coxme_status$coefficients[25]),
+      clean_status==2160 ~ paste0(coxme_status$coefficients[26]),
+      TRUE ~ paste0(0)
+    )),
+    xb_wait = coef_status + rand_intercept,
+    xb_tx_pre90 = coef_status + coef_tx + coef_status_tx + coef_tx_first_90 + coef_status_tx_first_90 + rand_intercept + rand_tx,
+    xb_tx_post90 = coef_status + coef_tx + coef_status_tx + rand_intercept + rand_tx
+    #surv_wait_4yr = p_surv_4yr^(exp(xb_wait)), 
+    #surv_tx_4yr = p_surv_4yr^(exp(xb_tx_post90)),
+    #survival_benefit_4yr = surv_tx_4yr - surv_wait_4yr
+  )
+
+
+
+```
+
+Forest Plots of HR
+```{r forest plot HR}
+#ts_tx_code is from coxme_status model (single coxme with status fixed effects)
+# HR(transplant|waitlist) was calculated as below (from Parker code)
+#   xb_wait = coef_status + rand_intercept,
+#   xb_tx = coef_status + rand_intercept + rand_tx + coef_tx + coef_status_tx,
+#   hr_tx = exp(xb_tx - xb_wait)
+#   therefore hr_tx = exp(rand_tx + coef_tx + coef_status_tx)
+#   therefore hr_tx_post90 = exp(rand_tx + coef_tx + coef_status_tx)
+#   surv90 variables excluded and coef_status canceled out by xb_wait
+
+
+# Estimate standard error of HR (can't use Coxme for this lincomR function)
+library(epimisc)
+lincom_1A <- lincomR(coxph_status, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_1B <- lincomR(coxph_status, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_2_3tier <- lincomR(coxph_status, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_1 <- lincomR(coxph_status, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_2 <- lincomR(coxph_status, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_3 <- lincomR(coxph_status, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_4 <- lincomR(coxph_status, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_5 <- lincomR(coxph_status, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_6 <- lincomR(coxph_status, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+detach(package:epimisc) #to reduce interference with dplyr
+detach(package:plyr)
+
+
+#Create data for plot
+hr_plot <- ts_tx_code %>%
+  group_by(status_def) %>%
+  mutate(
+# don't use se.exp.est because NOT the same as exp(se_est) - also the est from lincomR does not take into account the center effects so don't worry if the exp.est does not equal the hr calculated manually
+    se_hr = as.numeric(case_when(
+      clean_status==2010 ~ paste0(lincom_1A$se.est),
+      clean_status==2020 ~ paste0(lincom_1B$se.est),
+      clean_status==2030 ~ paste0(lincom_2_3tier$se.est),
+      clean_status==2110 ~ paste0(lincom_1$se.est),
+      clean_status==2120 ~ paste0(lincom_2$se.est),
+      clean_status==2130 ~ paste0(lincom_3$se.est),
+      clean_status==2140 ~ paste0(lincom_4$se.est),
+      clean_status==2150 ~ paste0(lincom_5$se.est),
+      clean_status==2160 ~ paste0(lincom_6$se.est),
+      TRUE ~ paste0(0)
+    )),
+    #in exp so log transform -> log scale
+    avg_loghr = mean(xb_tx_post90 - xb_wait),
+    avg_hr = exp(avg_loghr),
+    min_hr = exp(avg_loghr - 1.96*se_hr),
+    max_hr = exp(avg_loghr + 1.96*se_hr),
+    #min_hrtest = if_else(min_hr>0, min_hr, 0),
+  ) %>%
+  ungroup() 
+
+hr_avg <- hr_plot %>% distinct(clean_status, status_def, avg_hr, max_hr, min_hr)
+
+#Plot
+ggplot(data=hr_plot, aes(y=status_def, x=avg_hr, xmin=min_hr, xmax=max_hr)) +
+  geom_point(aes(color = factor(policy)), size=4) +
+  geom_errorbarh(height=.1) +
+  labs(title='Long-Run Hazard Ratio of Death with Transplant Relative to Death on Waitlist by Status', x='HR(transplant|waitlist)', y = 'Status') +
+  scale_y_discrete(limits=c("Status 1", "Status 2", "Status 3", "Status 4", "Status 5", "Status 6", "Status 1A", "Status 1B", "Status 2 (3 tier)")) +
+  scale_x_continuous(trans="log10", limits=c(0.01,10)) + 
+  geom_vline(xintercept=1, color='black', linetype='dashed', alpha=.5) + 
+  theme_classic() +
+    theme(
+    plot.title = element_text(hjust = 0.5, size = 12), 
+    axis.title.x = element_text(margin = margin(t = 10)), 
+    axis.title.y = element_text(margin = margin(r = 10))
+    ) +          
+  scale_color_jama()
+
+ggsave("HR Forest Plot.pdf")
+
+```
+
+Survival Curves by Status 
+```{r survival benefit curves}
+
+#   can ignore rand_intercept and rand_tx since they are normally distributed around 1
+#   xb_wait = coef_status + rand_intercept 
+#   xb_tx_pre90 = coef_status + rand_intercept + rand_tx + coef_tx + coef_status_tx + coef_surv90 + coef_surv90_status
+#   xb_tx_post90 = coef_status + rand_intercept + rand_tx + coef_tx + coef_status_tx 
+
+
+basehz <- function(coef_tx, coef_90, coef_status, coef_status_tx, coef_status_90) {
+  basehaz(coxph_status, centered=FALSE) %>%
+    mutate(hazard_inst = hazard - lag(hazard),
+           hazard = ifelse(is.na(hazard_inst), 0, hazard_inst),
+           hazard_wait = hazard * exp(coef_status),
+           hazard_tx = if_else(time<=90, 
+                  (hazard * exp(coef_tx + coef_90 + coef_status + coef_status_tx + coef_status_90)), 
+                  (hazard * exp(coef_tx + coef_status + coef_status_tx))),
+           H_tx = cumsum(hazard_tx),
+           H_wait = cumsum(hazard_wait),
+           S_tx = exp(-H_tx),
+           S_wait = exp(-H_wait),
+           S_tx_better = ifelse(S_tx >= S_wait, S_tx, NA),
+           S_wait_worse = ifelse(S_wait <= S_tx, S_wait, NA),
+           S_benefit = S_tx-S_wait
+    )
+}
+
+S_1a <- basehz(coxme_status$coefficients[1], coxme_status$coefficients[2], coxme_status$coefficients[3], coxme_status$coefficients[11], coxme_status$coefficients[19])
+S_1b <- basehz(coxme_status$coefficients[1], coxme_status$coefficients[2], coxme_status$coefficients[4], coxme_status$coefficients[12], coxme_status$coefficients[20])
+S_2_3tier <- basehz(coxme_status$coefficients[1], coxme_status$coefficients[2], 1, 1, 1)
+S_1 <- basehz(coxme_status$coefficients[1], coxme_status$coefficients[2], coxme_status$coefficients[5], coxme_status$coefficients[13], coxme_status$coefficients[21])
+S_2 <- basehz(coxme_status$coefficients[1], coxme_status$coefficients[2], coxme_status$coefficients[6], coxme_status$coefficients[14], coxme_status$coefficients[22])
+S_3 <- basehz(coxme_status$coefficients[1], coxme_status$coefficients[2], coxme_status$coefficients[7], coxme_status$coefficients[15], coxme_status$coefficients[23])
+S_4 <- basehz(coxme_status$coefficients[1], coxme_status$coefficients[2], coxme_status$coefficients[8], coxme_status$coefficients[16], coxme_status$coefficients[24])
+S_5 <- basehz(coxme_status$coefficients[1], coxme_status$coefficients[2], coxme_status$coefficients[9], coxme_status$coefficients[17], coxme_status$coefficients[25])
+S_6 <- basehz(coxme_status$coefficients[1], coxme_status$coefficients[2], coxme_status$coefficients[10], coxme_status$coefficients[18], coxme_status$coefficients[26])
+
+plot_sb <- function(data, status) {
+  ggplot(data, aes(x=time)) + 
+  geom_step(aes(y=S_wait, color="Waitlist"), size=1.1) +
+  geom_step(aes(y=S_tx, color="Transplant"), size=1.1) + 
+  geom_ribbon(aes(ymin = S_wait_worse, ymax = S_tx_better, fill = "Survival Benefit"), alpha = 0.75) +
+  #geom_vline(xintercept=90, color='black', linetype='dashed', alpha=.5) +
+  scale_y_continuous (limits=c(0,1)) + 
+  scale_x_continuous (limits=c(0,1095)) +
+  labs(title=status, x='Days', y = '') +  
+  theme_classic() + 
+  scale_color_manual(name = "", values=c("darkorange", "darkgrey")) +
+  scale_fill_manual(name = NULL, values=c("lightskyblue1")) +
+  theme(plot.title=element_text(hjust=0.5), legend.position="bottom", axis.text = element_text(size = 12)) 
+}
+#missing values from truncating axes
+
+grid.arrange(plot_sb(S_1, 'Status 1'), plot_sb(S_2, 'Status 2'), plot_sb(S_3, 'Status 3'), 
+             nrow=1, top="Survival Benefit by Status", left="Overall Survival")
+grid.arrange(plot_sb(S_4, 'Status 4'), plot_sb(S_5, 'Status 5'), plot_sb(S_6, 'Status 6'), 
+             nrow=1, top="Survival Benefit by Status", left="Overall Survival")
+grid.arrange(plot_sb(S_1a, 'Status 1A'), plot_sb(S_1b, 'Status 1B'), plot_sb(S_2_3tier, 'Status 2 (3 tier)'), 
+             nrow=1, top="Survival Benefit by Status", left="Overall Survival")
+
+percentage_point_diff <- S_6 %>% filter(time==1095) %>%
+  distinct(time, S_tx, S_wait, S_benefit)
+
+```
+
+#Calculate Difference in RMST between 1A and 1
+```{r}
+
+test <- S_1 %>% left_join(S_1a, by="time") %>%
+  filter(time <= (365*3)) %>%
+  mutate(time_step = time - lag(time),
+         surv_diff_1 = (S_tx.x - S_wait.x)*time_step,
+         surv_diff_1a = (S_tx.y - S_wait.y)*time_step,
+         surv_diff_tx = (S_tx.x - S_tx.y)*time_step,
+         surv_diff_wait = (S_wait.x - S_wait.y)*time_step)
+
+# Calculate sums for each surv_diff column
+rmst_1 <- sum(test$surv_diff_1, na.rm = TRUE)
+rmst_1a <- sum(test$surv_diff_1a, na.rm = TRUE)
+rmst_diff_tx <- sum(test$surv_diff_tx, na.rm = TRUE)
+rmst_diff_wait <- sum(test$surv_diff_wait, na.rm = TRUE)
+# Difference in RMST between 1 and 1A
+rmst_diff_1_1a <- rmst_1 - rmst_1a
+
+#plot
+ggplot(test, aes(x=time)) + 
+  geom_step(aes(y=S_tx.x, color="Transplant Status 1"), size=1.1) +
+  geom_step(aes(y=S_tx.y, color="Transplant Status 1A"), size=1.1) +
+  geom_step(aes(y=S_wait.x, color="Waitlist Status 1"), size=1.1) + 
+  geom_step(aes(y=S_wait.y, color="Waitlist Status 1A"), size=1.1) +
+  scale_y_continuous (limits=c(0,1)) + 
+  scale_x_continuous (limits=c(0,1095)) +
+  labs(title='', x='Days', y = 'Probability of Survival') +  
+  theme_classic() +
+  theme(plot.title=element_text(hjust=0.5), legend.position="right", legend.title=element_blank(), axis.text = element_text(size = 12)) +
+  scale_color_jama() 
+
+ggsave("Status1A v Status1 RMST.pdf")
+
+```
+
+# Calculate time to transplant for each patient
+```{r}
+transplant_times <- ts_status_code %>%
+  select(PX_ID, status_def, policy, t_1, t_2, tx_first_90, tx_obs_flag, dead, starts_with("status")) %>%
+  filter(tx_obs_flag == 1 & tx_first_90 == 1) %>%
+  select(PX_ID, time_tx = t_1 )
+```
+
+# Extract center effects and merge with transplant dataset
+```{r}
+center_coef <- as.data.frame(coxme_status[["frail"]][["center"]])
+
+center_coef <- center_coef %>%
+  cbind(CAN_LISTING_CTR_CD = rownames(center_coef)) %>%
+  rename(ctr_intercept = Intercept,
+         ctr_tx = tx_obs_flag)
+
+center_coef
+```
+
+```{r}
+ts_tx_code <- ts_tx_code %>%
+  left_join(ts_status_code %>% 
+              select(PX_ID, CAN_LISTING_CTR_CD) %>%
+              distinct()) %>%
+  left_join(center_coef) %>%
+  left_join(transplant_times)
+```
+
+
+# Maximum time on base hazard function
+```{r}
+max_time_basehz <- basehaz(coxph_status, centered=FALSE) %>%
+  pull(time) %>%
+  max()
+
+max_tx_time <- max_time_basehz - 4*365.25
+max_tx_time_3yr <- max_time_basehz - 3*365.25
+
+ggplot(transplant_times, aes(x = time_tx)) +
+  geom_histogram(binwidth = 5, fill = "skyblue", color = "black", alpha = 0.7) +
+  labs(title = "Histogram of X",
+       x = "X values",
+       y = "Frequency") 
+obs_less_730 <- sum(transplant_times$time < 730)
+
+```
+The maximum baseline hazard time of `r max_time_basehz` days means we can estimate 4-year RMST gain only for candidates transplanted within `r max_tx_time` days of listing
+
+However, we can estimated 3-year RMST gain for candidates transplanted within `r max_tx_time_3yr`of listing.
+
+# Survival counterfactuals for every patient
+
+```{r}
+#pulling out the estimation of the base cumulative Hazard and conversion to hazard
+#avoids repeating in the function unecessarily
+base_hz_df <-basehaz(coxph_status, centered=FALSE) %>%
+  mutate(hazard = hazard - lag(hazard),
+           hazard = ifelse(is.na(hazard), 0, hazard)) 
+
+
+
+
+survival_functions <- function(PX_ID, policy, status_def, time_tx,
+                               ctr_intercept, ctr_tx,
+                               coef_status, 
+                               coef_tx, coef_90, coef_status_tx, coef_status_90, 
+                               hazard_df = base_hz_df) {
+  
+  coef_status <- coef_status + ctr_intercept
+  coef_tx <- coef_tx + ctr_tx
+  
+  hazard_df %>%
+    mutate(PX_ID = PX_ID,
+           time = time - time_tx) %>%
+    filter(time >= 0) %>%
+    mutate(hazard_wait = hazard * exp(coef_status),
+           hazard_tx = if_else(time <= 90, 
+                               (hazard * exp(coef_tx + coef_90 + coef_status + 
+                                               coef_status_tx + coef_status_90)), 
+                               (hazard * exp(coef_tx + coef_status + 
+                                               coef_status_tx))),
+           H_tx = cumsum(hazard_tx),
+           H_wait = cumsum(hazard_wait),
+           S_tx = exp(-H_tx),
+           S_wait = exp(-H_wait),
+           S_tx_better = ifelse(S_tx >= S_wait, S_tx, NA), # these are just nice to make fancy plots
+           S_wait_worse = ifelse(S_wait <= S_tx, S_wait, NA),# these are just nice to make fancy plots
+           S_benefit = S_tx - S_wait,
+           status_def = status_def,
+           policy = policy
+    )
+}
+```
+
+## Survival with and without transplant predictions for first patient
+
+### Note: names were off here
+```{r, warning=FALSE}
+ts_tx_code %>%
+  filter(PX_ID == 937666) %>%
+  select(PX_ID, status_def, policy, time_tx,
+         ctr_intercept, ctr_tx,
+         coef_status,
+         coef_tx, coef_90 = coef_tx_first_90, coef_status_tx,
+         coef_status_90 = coef_status_tx_first_90) %>%
+  pmap_df(survival_functions) %>%
+  filter(time <= 1460) %>%
+  select(time, S_tx, S_wait) %>%
+  pivot_longer(cols = -time, names_prefix = "S_", 
+               values_to = "Survival", names_to = "counterfactual") %>%
+ggplot(aes(x= time, y = Survival, color = counterfactual)) +
+  geom_step()
+```
+
+# Calculate survival predictions for entire recipient population
+Note I dropped the time filter here to maximize the survival counterfactual prediction length
+```{r, warning=FALSE}
+results_status <- ts_tx_code %>%
+  select(PX_ID, status_def, policy, time_tx,
+         ctr_intercept, ctr_tx,
+         coef_status,
+         coef_tx, coef_90 = coef_tx_first_90, coef_status_tx,
+         coef_status_90 = coef_status_tx_first_90) %>%
+  pmap_df(survival_functions)
+```
+
+# Nest result dataframe and calculate RMST
+```{r}
+nested_results <- results_status %>% 
+  group_by(PX_ID) %>% 
+  mutate(max_time = max(time)) %>%
+  group_by(PX_ID, status_def, max_time, policy) %>% nest()
+```
+
+## RMST function with restriction time parameter
+
+Note I set the default to 3 years 
+```{r}
+rmst_calc <- function(df, restrict_time = 365*3) {
+  df %>%
+    filter(time <= restrict_time) %>%
+    mutate(time_step = time - lag(time, default = 0),
+           surv_benefit = (S_tx - S_wait) * time_step,
+           wait_rmst = S_wait * time_step,
+           tx_rmst = S_tx * time_step) %>%
+    summarise(
+      total_surv_benefit = sum(surv_benefit, na.rm = TRUE),
+      total_wait_rmst = sum(wait_rmst, na.rm = TRUE),
+      total_tx_rmst = sum(tx_rmst, na.rm = TRUE)
+    ) 
+}
+
+```
+
+
+```{r}
+rmst_results <- nested_results %>%
+  mutate(rmst = map_dfr(data, rmst_calc)) %>%
+  unnest(rmst) %>%
+  rename(rmst = total_surv_benefit,
+         rmst_wait = total_wait_rmst,
+         rmst_tx = total_tx_rmst)
+
+num_days <- rmst_results %>%
+  ungroup() %>%
+  mutate(total_days = sum(max_time)) %>%
+  distinct(total_days)
+
+```
+
+
+## Check relationship between maximum time and RMST
+```{r}
+rmst_results %>%
+  ggplot(aes(x= max_time, y = rmst, color = status_def)) +
+  geom_point()
+```
+## Distribution of survival benefit by status
+```{r}
+# Define the extended palette from JAMA
+extended_palette <- c(
+  "#374e55", "#df8f44", "#00a1d5", "#b24745", "#79af97", "#6a6599", "#80796b", "#4f9da6"
+)
+
+rmst_plot <- ggplot(rmst_results, aes(x=status_def, y=rmst,  color=status_def, fill=status_def)) + 
+  geom_dotplot(binaxis = "y", stackdir='center', binwidth =  10, dotsize = 0.18, stackratio =0.5) + 
+  geom_boxplot(alpha = 0, color = "black", outlier.shape = NA, width = 0.2, lwd=0.5, fatten = 1.5) + 
+  scale_x_discrete(limits=c("", "Status 1A", "Status 1B", "Status 1", "Status 2", "Status 3", "Status 4", "Status 5", "Status 6")) +  
+  #scale_y_continuous(breaks=seq(-200, 1200, 200)) + 
+  labs(title="Absolute 3-Year Survival Benefit of Transplantation", y = "Restricted Mean Survival Time (Days)", x ="Status") +
+  scale_fill_manual(values=extended_palette) + 
+  scale_color_manual(values=extended_palette) + 
+  theme(legend.position="none", plot.title = element_text(hjust = 0.5), panel.grid.major.x = element_blank(), panel.grid.minor.y = element_blank()) 
+
+print(rmst_plot)
+
+ggsave("3_year_benefit.pdf")
+
+#Extract Summary Statistics
+summary_policy <- rmst_results %>%
+  group_by(policy) %>%
+  summarize(
+    count=n(), 
+    mean_rmst=mean(rmst),
+    lower_quartile = quantile(rmst, 0.25), 
+    upper_quartile = quantile(rmst, 0.75),
+    tot_rmst = sum(rmst)
+  ) %>%
+  distinct(policy, count, mean_rmst, lower_quartile, upper_quartile, tot_rmst)
+# Extract data for each group
+group_pre <- rmst_results$rmst[rmst_results$policy == "Pre"]
+group_post <- rmst_results$rmst[rmst_results$policy == "Post"]
+# Perform a two-sample t-test
+t_pre_post_rmst <- t.test(group_pre, group_post)
+# Extract the p-value
+p_pre_post_rmst <- t_pre_post_rmst$p.value
+
+#Between Center Variance 
+var_rmst <- rmst_results %>%
+  ungroup() %>%
+  group_by(status_def) %>%
+  mutate(variance = var(rmst)) %>%
+  distinct(status_def, variance)
+#Perform F-test
+group_1 <- rmst_results$rmst[rmst_results$status_def == "Status 5"]
+group_2 <- rmst_results$rmst[rmst_results$status_def == "Status 1B"]
+test_result <- var.test(group_1, group_2)
+# Extract p-value
+p_value <- test_result$p.value
+  
+```
+Now variation reflects time to transplantation *and* center effects
+
+RMST of Waitlist Compared to RMST of Transplant by Status 
+```{r}
+
+filtered_rmst_results <- rmst_results %>%
+  filter(status_def !="Status 2 (3 tier)") 
+
+#Extract Summary Statistics
+summary_status <- filtered_rmst_results %>%
+  group_by(status_def) %>%
+  summarize(
+    mean_rmst=mean(rmst),
+    mean_rmst_wait=mean(rmst_wait),
+    mean_rmst_tx=mean(rmst_tx),
+    sd_rmst = sd(rmst),
+    lower_quartile = quantile(rmst, 0.25), 
+    upper_quartile = quantile(rmst, 0.75),
+    n = n()
+  ) %>%
+  mutate(
+    low_ci = mean_rmst - 1.96*sd_rmst/sqrt(n-1),
+    up_ci = mean_rmst + 1.96*sd_rmst/sqrt(n-1)
+  ) %>%
+  distinct(status_def, n, mean_rmst, mean_rmst_wait, mean_rmst_tx, sd_rmst, low_ci, up_ci, lower_quartile, upper_quartile)
+
+model_wait <-lm(mean_rmst_wait~mean_rmst,data=summary_status)
+model_tx <-lm(mean_rmst_tx~mean_rmst,data=summary_status)
+
+
+rmst_plot_wait <- ggplot(summary_status, aes(x=mean_rmst_wait, y=mean_rmst, color=status_def, fill=status_def)) +
+  geom_point(size=4) +
+  #geom_smooth(method = "lm", se = FALSE, color = "black") +
+  lims(x=c(-100,1000),y=c(-100,1000)) +
+  labs(title="", y = "Survival Benefit RMST (days)", x ="Waitlist RMST (days)") +
+  scale_fill_manual(values=extended_palette) + 
+  scale_color_manual(values=extended_palette) + 
+  theme(legend.position="none", legend.title=element_blank(), plot.title = element_text(hjust = 0.5), panel.grid.major.x = element_blank(), panel.grid.minor.y = element_blank()) 
+
+rmst_plot_tx <- ggplot(summary_status, aes(x=mean_rmst_tx, y=mean_rmst, color=status_def, fill=status_def)) +
+  geom_point(size=4) +
+  #geom_smooth(method = "lm", se = FALSE, color = "black") +
+  lims(x=c(-100,1000),y=c(-100,1000)) +
+  labs(title="", y = "Survival Benefit RMST (days)", x ="Post-Transplantation RMST (days)") +
+  scale_fill_manual(values=extended_palette) + 
+  scale_color_manual(values=extended_palette) + 
+  theme(legend.position="none", legend.title=element_blank(), plot.title = element_text(hjust = 0.5), panel.grid.major.x = element_blank(), panel.grid.minor.y = element_blank()) 
+
+ggarrange(rmst_plot_wait, rmst_plot_tx, common.legend=TRUE, legend="bottom", nrow=1)
+
+cor_rmst_wait <- cor(filtered_rmst_results$rmst, filtered_rmst_results$rmst_wait, method ="pearson") 
+cor_rmst_tx <- cor(filtered_rmst_results$rmst, filtered_rmst_results$rmst_tx,  method ="pearson")
+
+ggsave("RMST v Wait v Tx.pdf")
+
+```
+
+
+```{r statistical significance testing}
+#statistical significance comparing HRa to HRb 
+#se(HRa-HRb) ... Var(A-B) = Var(A) + Var(B) - 2*Cov(A, B). 
+#Cov(HR1A, HR2) = 0, as they are estimated from different models and assumed to be independent. So t statistic for 1A vs. 2 is: (0.289 - 0.264)/sqrt(0.035^2 + 0.050^2) = 0.409616
+t_hr1a_hr1 <- abs((lincom_1A$exp.est - lincom_1$exp.est)/(sqrt((lincom_1A$se.exp.est)^2 + (lincom_1$se.exp.est)^2)))
+t_hr1a_hr2 <- abs((lincom_1A$exp.est - lincom_2$exp.est)/(sqrt((lincom_1A$se.exp.est)^2 + (lincom_2$se.exp.est)^2)))
+#p-value from t-score 
+p_hr1a_hr1 <- 2*pt(t_hr1a_hr1, df=(89937-2), lower.tail=FALSE)
+p_hr1a_hr2 <- 2*pt(t_hr1a_hr2, df=(89937-2), lower.tail=FALSE)
+
+```
+
+```{r}
+
+test <- nested_results %>%
+  group_by(policy) %>% 
+  mutate(sum_pol = sum(rmst),
+         count_pol = n()) %>%
+  distinct(policy, sum_pol, count_pol)
+
+```
+
+Sample data frame
+```{r}
+sample_df <- ts_status_code %>% 
+  select(PX_ID, clean_status, tx_obs_flag, tx_first_90, dead, t_1, t_2, date_start, date_end, fin_date)
+```
+
+```{r save cox model output}
+
+save(coxme_status, file="coxme_status.rda")
+save(coxph_status, file="coxph_status.rda")
+
+save(nested_results, file = "nested_result_df.Rdata" )
+
+```
+
+    

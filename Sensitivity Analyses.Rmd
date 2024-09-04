@@ -1,0 +1,600 @@
+---
+title: "Sensitivity Analyses"
+author: "Stratton Tolmie"
+date: "8/6/2024"
+output: pdf_document
+---
+
+
+install
+```{r setup, include=FALSE}
+
+rm(list = ls())
+
+knitr::opts_chunk$set(echo = TRUE)
+
+library(survival)
+library(survminer)
+library(coxme)
+library(insight)
+library(ggplot2)
+library(tidyverse) 
+library(zoo)
+library(ggsci)
+library(tibble)
+library(gridExtra)
+library(dplyr)
+library(haven)
+
+```
+
+```{r Read CSV}
+ts_status <- read.csv("ts_status.csv", row.names=1)
+tx_hr <- read_sas("tx_hr.sas7bdat", NULL) %>%  
+  zap_formats() %>% zap_labels()
+cand_thor <- read_sas("cand_thor.sas7bdat", NULL) %>%  
+  zap_formats() %>% zap_labels()
+
+```
+
+```{r introduce surv_90 variable ts_status}
+
+to_model <- ts_status %>% select(PX_ID, CAN_LISTING_CTR_CD, policy, to_tx, tx_obs_flag, to_die, first_ob, tx_obs_flag, last_ob, status, clean_status, status_def, dead, last_ob, list_date, t_1, t_2, date_start, date_end, tx_date, dead_date, lafu_date, rem_date, rem_cd, last_act_date, fin_date, final_date, , tfl_last, last_ob) %>%
+  mutate(first_tx_ob = 0)
+
+waitlist <- to_model %>% 
+  filter(tx_obs_flag == 0) %>%
+  mutate(tx_first_90 = 0)
+
+first_cut <- 90
+
+first_post_trans_ob <- to_model %>%
+  filter(tx_obs_flag ==1) %>%
+  mutate(t_post_trans = t_2 -t_1,
+         t_2 = ifelse(t_post_trans > first_cut, t_1 + first_cut, t_2),
+         dead = ifelse(t_post_trans > first_cut, 0, dead)) %>%
+  select(-t_post_trans)%>%
+  mutate(tx_first_90 = 1,
+         first_tx_ob = 1)
+
+second_post_trans_ob <- to_model %>%
+  filter(tx_obs_flag ==1) %>% 
+  mutate(t_post_trans = t_2 - t_1) %>% 
+  filter(t_post_trans > first_cut) %>%
+  mutate(t_1 = t_1 + first_cut,
+         tx_first_90=0)%>%
+  select(-t_post_trans)
+
+extended_ts_status <- waitlist %>%
+  rbind(first_post_trans_ob) %>%
+  rbind(second_post_trans_ob) %>%
+  arrange(PX_ID, t_1) 
+
+test <- extended_ts_status %>% select(PX_ID, t_1, t_2, clean_status, tx_obs_flag, first_tx_ob, tx_first_90, dead) 
+#see 1115292 for example (also 1115409)
+
+```
+
+```{r prepare data for cox models}
+
+ts_status_code <- extended_ts_status %>% 
+  mutate(
+        status_1A = ifelse(clean_status==2010,1,0),
+        status_1B = ifelse(clean_status==2020,1,0),
+        status_2 = if_else(clean_status==2030,1,0),
+        status1 = if_else(clean_status==2110,1,0),
+        status2 = if_else(clean_status==2120,1,0),
+        status3 = if_else(clean_status==2130,1,0),
+        status4 = if_else(clean_status==2140,1,0),
+        status5 = if_else(clean_status==2150,1,0),
+        status6 = if_else(clean_status==2160,1,0),
+        center = case_when(
+          is.na(CAN_LISTING_CTR_CD) == FALSE ~ CAN_LISTING_CTR_CD),
+        center = na.locf(center))
+
+```
+
+```{r introduce donor covariates}
+
+#DONOR Characteristics
+ts_status_code_donor <- ts_status_code %>%
+  left_join(tx_hr %>%
+              select(
+                PX_ID,
+                DON_AGE,
+                DON_ABO,
+                DON_GENDER,
+                DON_RACE,
+                DON_CREAT,
+                DON_HIGH_CREAT,
+                DON_HIST_DIAB,
+                DON_HTN,
+                DON_WARM_ISCH_TM_MINS,
+                REC_HR_ISCH,
+                DON_HIST_CIGARETTE_GT20_PKYR,
+                DON_HIST_COCAINE
+                ), 
+            by="PX_ID") %>%
+  mutate(
+    Gender = factor(DON_GENDER, levels = c("F", "M")),
+    Race = case_when(DON_RACE==8 ~ "White",
+                          DON_RACE==16 ~ "Black",
+                          DON_RACE==2000 ~ "Hispanic", 
+                          TRUE ~ "Other"),
+    creatinine = DON_CREAT,
+    high_cr = case_when(DON_HIGH_CREAT==1 ~ ">1.5",
+                        DON_HIGH_CREAT==0 ~ "<1.5"),
+    Diabetes = case_when(DON_HIST_DIAB>1 & DON_HIST_DIAB<6 ~ "zHistory of DM",
+                         DON_HIST_DIAB==1 ~ "Non-diabetic",
+                         TRUE ~ "Unknown"),
+    Hypertension = case_when(DON_HTN==1 ~ "zHistory of HTN",
+                             DON_HTN==0 ~ "Non-hypertensive",
+                             TRUE ~ "Unknown"),
+    ischemic_time_warm = DON_WARM_ISCH_TM_MINS,
+    ischemic_time = REC_HR_ISCH,
+    blood_type = factor(
+           case_when(
+             DON_ABO %in% c("A", "A1", "A2") ~ "A",
+             DON_ABO %in% c("A1B", "A2B") ~ "AB",
+             TRUE ~ DON_ABO)),
+    packyear_20 = case_when(DON_HIST_CIGARETTE_GT20_PKYR =="N" ~ "No",
+                 DON_HIST_CIGARETTE_GT20_PKYR =="Y" ~ "Yes",
+                 TRUE ~ "Unknown"),
+    cocaine = case_when(DON_HIST_COCAINE =="N" ~ "No",
+                 DON_HIST_COCAINE =="Y" ~ "Yes",
+                 TRUE ~ "Unknown"),
+    ) %>%
+  select(-DON_GENDER, -DON_RACE, -DON_ABO, -DON_CREAT, -DON_HIGH_CREAT, -DON_HIST_DIAB, -DON_HTN, -DON_WARM_ISCH_TM_MINS, -DON_HIST_CIGARETTE_GT20_PKYR, -DON_HIST_COCAINE, -REC_HR_ISCH)
+  
+  
+```
+
+```{r coxph model}
+##---------------------------------------
+
+ts_status_code_donor$ischemic_time_combined <- ifelse(ts_status_code_donor$tx_obs_flag == 1, ts_status_code_donor$ischemic_time, 0)
+#model will delete 119 obs for which tx_obs_flag = 1 but ischemic_time = NA
+#the coefficient for ischemic_time_combined reflects the impact of ischemic_time on survival for those patients who received a transplant. For non-transplant patients, ischemic_time_combined is zero and does not influence the survival estimates.
+
+coxph_status_donor <- coxph(
+  Surv(t_1, t_2, dead) ~ tx_obs_flag + tx_first_90 + status_1A + status_1B + status1 + status2 + status3 + status4 + status5 + status6 +
+    tx_obs_flag*(status_1A + status_1B + status1 + status2 + status3 + status4 + status5 + status6) +
+    tx_first_90*(status_1A + status_1B + status1 + status2 + status3 + status4 + status5 + status6) +
+    tx_obs_flag:ischemic_time_combined +
+    cluster(center),
+  data = ts_status_code_donor
+)
+print(coxph_status_donor)
+
+
+ts_tx_code_donor <- ts_status_code_donor %>% 
+  filter(first_tx_ob==1) %>% 
+  select(PX_ID, clean_status, status_def, tx_obs_flag, center, policy, dead, tx_obs_flag, t_1, t_2, 
+         date_start, date_end, fin_date, rem_cd, 
+         status_1A, status_1B, status_2, status1, status2, status3, status4, status6) %>%
+  mutate(
+    status_def = case_when(clean_status==2030 ~ paste0("Status 2 (3 tier)"),
+                           TRUE ~ paste0(status_def)),
+    coef_tx = coxph_status_donor$coefficients[1],
+    coef_tx_first_90 = coxph_status_donor$coefficients[2],
+    coef_status = as.numeric(case_when(
+      clean_status==2010 ~ paste0(coxph_status_donor$coefficients[3]),
+      clean_status==2020 ~ paste0(coxph_status_donor$coefficients[4]),
+      clean_status==2030 ~ paste0(1),
+      clean_status==2110 ~ paste0(coxph_status_donor$coefficients[5]),
+      clean_status==2120 ~ paste0(coxph_status_donor$coefficients[6]),
+      clean_status==2130 ~ paste0(coxph_status_donor$coefficients[7]),
+      clean_status==2140 ~ paste0(coxph_status_donor$coefficients[8]),
+      clean_status==2150 ~ paste0(coxph_status_donor$coefficients[9]),
+      clean_status==2160 ~ paste0(coxph_status_donor$coefficients[10]),
+      
+      TRUE ~ paste0(0)
+    )),
+    coef_status_tx = as.numeric(case_when(
+      clean_status==2010 ~ paste0(coxph_status_donor$coefficients[11]),
+      clean_status==2020 ~ paste0(coxph_status_donor$coefficients[12]),
+      clean_status==2030 ~ paste0(1),
+      clean_status==2110 ~ paste0(coxph_status_donor$coefficients[13]),
+      clean_status==2120 ~ paste0(coxph_status_donor$coefficients[14]),
+      clean_status==2130 ~ paste0(coxph_status_donor$coefficients[15]),
+      clean_status==2140 ~ paste0(coxph_status_donor$coefficients[16]),
+      clean_status==2150 ~ paste0(coxph_status_donor$coefficients[17]),
+      clean_status==2160 ~ paste0(coxph_status_donor$coefficients[18]),
+      TRUE ~ paste0(0)
+    )),
+    coef_status_tx_first_90 = as.numeric(case_when(
+      clean_status==2010 ~ paste0(coxph_status_donor$coefficients[19]),
+      clean_status==2020 ~ paste0(coxph_status_donor$coefficients[20]),
+      clean_status==2030 ~ paste0(1),
+      clean_status==2110 ~ paste0(coxph_status_donor$coefficients[21]),
+      clean_status==2120 ~ paste0(coxph_status_donor$coefficients[22]),
+      clean_status==2130 ~ paste0(coxph_status_donor$coefficients[23]),
+      clean_status==2140 ~ paste0(coxph_status_donor$coefficients[24]),
+      clean_status==2150 ~ paste0(coxph_status_donor$coefficients[25]),
+      clean_status==2160 ~ paste0(coxph_status_donor$coefficients[26]),
+      TRUE ~ paste0(0)
+    )),
+    xb_wait = coef_status,
+    xb_tx_pre90 = coef_status + coef_tx + coef_status_tx + coef_tx_first_90 + coef_status_tx_first_90,
+    xb_tx_post90 = coef_status + coef_tx + coef_status_tx
+  )
+
+# Estimate standard error of HR (can't use Coxme for this lincomR function)
+library(epimisc)
+lincom_1A <- lincomR(coxph_status_donor, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_1B <- lincomR(coxph_status_donor, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_2_3tier <- lincomR(coxph_status_donor, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_1 <- lincomR(coxph_status_donor, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_2 <- lincomR(coxph_status_donor, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_3 <- lincomR(coxph_status_donor, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_4 <- lincomR(coxph_status_donor, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_5 <- lincomR(coxph_status_donor, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_6 <- lincomR(coxph_status_donor, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+detach(package:epimisc) #to reduce interference with dplyr
+detach(package:plyr)
+
+
+#Create data for plot
+hr_plot_donor <- ts_tx_code_donor %>%
+  group_by(status_def) %>%
+  mutate(
+    se_hr = as.numeric(case_when(
+      clean_status==2010 ~ paste0(lincom_1A$se.est),
+      clean_status==2020 ~ paste0(lincom_1B$se.est),
+      clean_status==2030 ~ paste0(lincom_2_3tier$se.est),
+      clean_status==2110 ~ paste0(lincom_1$se.est),
+      clean_status==2120 ~ paste0(lincom_2$se.est),
+      clean_status==2130 ~ paste0(lincom_3$se.est),
+      clean_status==2140 ~ paste0(lincom_4$se.est),
+      clean_status==2150 ~ paste0(lincom_5$se.est),
+      clean_status==2160 ~ paste0(lincom_6$se.est),
+      TRUE ~ paste0(0)
+    )),
+    #in exp so log transform -> log scale
+    avg_loghr = mean(xb_tx_post90 - xb_wait),
+    avg_hr = exp(avg_loghr),
+    min_hr = exp(avg_loghr - 1.96*se_hr),
+    max_hr = exp(avg_loghr + 1.96*se_hr),
+  ) %>%
+  ungroup() 
+
+hr_avg_donor<- hr_plot_donor %>% distinct(clean_status, status_def, avg_hr, min_hr, max_hr, policy)
+
+#Plot
+ggplot(data=hr_plot_donor, aes(y=status_def, x=avg_hr, xmin=min_hr, xmax=max_hr)) +
+  geom_point(aes(color = factor(policy)), size=4) +
+  geom_errorbarh(height=.1) +
+  labs(title='Long-Run HR(Death with Transplant | Death on Waitlist) by Status, Controlling for Ischemic Time', x='HR(transplant|waitlist)', y = 'Status') +
+  scale_y_discrete(limits=c("Status 1", "Status 2", "Status 3", "Status 4", "Status 5", "Status 6", "Status 1A", "Status 1B", "Status 2 (3 tier)")) +
+  scale_x_continuous(trans="log10", limits=c(0.01,10)) + 
+  geom_vline(xintercept=1, color='black', linetype='dashed', alpha=.5) + 
+  theme_classic() +
+    theme(
+    plot.title = element_text(hjust = 0.5, size = 12), 
+    axis.title.x = element_text(margin = margin(t = 10)), 
+    axis.title.y = element_text(margin = margin(r = 10))
+    ) +          
+  scale_color_jama()
+
+ggsave("3_year_benefit_isch_control.pdf")
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+```{r }
+##---------------------------------------
+
+ts_status_code_donor$ischemic_time_combined <- ifelse(ts_status_code_donor$tx_obs_flag == 1, ts_status_code_donor$ischemic_time, 0)
+#model will delete 119 obs for which tx_obs_flag = 1 but ischemic_time = NA
+#the coefficient for ischemic_time_combined reflects the impact of ischemic_time on survival for those patients who received a transplant. For non-transplant patients, ischemic_time_combined is zero and does not influence the survival estimates.
+
+coxph_status_donor <- coxph(
+  Surv(t_1, t_2, dead) ~ tx_obs_flag + tx_first_90 + status_1A + status_1B + status1 + status2 + status3 + status4 + status5 + status6 + Diabetes + Hypertension + packyear_20 + cocaine + 
+    tx_obs_flag*(status_1A + status_1B + status1 + status2 + status3 + status4 + status5 + status6) +
+    tx_first_90*(status_1A + status_1B + status1 + status2 + status3 + status4 + status5 + status6) +
+    tx_obs_flag:ischemic_time_combined +
+    cluster(center),
+  data = ts_status_code_donor
+)
+print(coxph_status_donor)
+
+ts_tx_code_donor <- ts_status_code_donor %>% 
+  filter(first_tx_ob==1) %>% 
+  select(PX_ID, clean_status, status_def, tx_obs_flag, center, policy, dead, tx_obs_flag, t_1, t_2, 
+         date_start, date_end, fin_date, rem_cd, 
+         status_1A, status_1B, status_2, status1, status2, status3, status4, status6) %>%
+  mutate(
+    status_def = case_when(clean_status==2030 ~ paste0("Status 2 (3 tier)"),
+                           TRUE ~ paste0(status_def)),
+    coef_tx = coxph_status_donor$coefficients[1],
+    coef_tx_first_90 = coxph_status_donor$coefficients[2],
+    coef_status = as.numeric(case_when(
+      clean_status==2010 ~ paste0(coxph_status_donor$coefficients[3]),
+      clean_status==2020 ~ paste0(coxph_status_donor$coefficients[4]),
+      clean_status==2030 ~ paste0(1),
+      clean_status==2110 ~ paste0(coxph_status_donor$coefficients[5]),
+      clean_status==2120 ~ paste0(coxph_status_donor$coefficients[6]),
+      clean_status==2130 ~ paste0(coxph_status_donor$coefficients[7]),
+      clean_status==2140 ~ paste0(coxph_status_donor$coefficients[8]),
+      clean_status==2150 ~ paste0(coxph_status_donor$coefficients[9]),
+      clean_status==2160 ~ paste0(coxph_status_donor$coefficients[10]),
+      
+      TRUE ~ paste0(0)
+    )),
+    coef_status_tx = as.numeric(case_when(
+      clean_status==2010 ~ paste0(coxph_status_donor$coefficients[19]),
+      clean_status==2020 ~ paste0(coxph_status_donor$coefficients[20]),
+      clean_status==2030 ~ paste0(1),
+      clean_status==2110 ~ paste0(coxph_status_donor$coefficients[21]),
+      clean_status==2120 ~ paste0(coxph_status_donor$coefficients[22]),
+      clean_status==2130 ~ paste0(coxph_status_donor$coefficients[23]),
+      clean_status==2140 ~ paste0(coxph_status_donor$coefficients[24]),
+      clean_status==2150 ~ paste0(coxph_status_donor$coefficients[25]),
+      clean_status==2160 ~ paste0(coxph_status_donor$coefficients[26]),
+      TRUE ~ paste0(0)
+    )),
+    coef_status_tx_first_90 = as.numeric(case_when(
+      clean_status==2010 ~ paste0(coxph_status_donor$coefficients[27]),
+      clean_status==2020 ~ paste0(coxph_status_donor$coefficients[28]),
+      clean_status==2030 ~ paste0(1),
+      clean_status==2110 ~ paste0(coxph_status_donor$coefficients[29]),
+      clean_status==2120 ~ paste0(coxph_status_donor$coefficients[30]),
+      clean_status==2130 ~ paste0(coxph_status_donor$coefficients[31]),
+      clean_status==2140 ~ paste0(coxph_status_donor$coefficients[32]),
+      clean_status==2150 ~ paste0(coxph_status_donor$coefficients[33]),
+      clean_status==2160 ~ paste0(coxph_status_donor$coefficients[34]),
+      TRUE ~ paste0(0)
+    )),
+    xb_wait = coef_status,
+    xb_tx_pre90 = coef_status + coef_tx + coef_status_tx + coef_tx_first_90 + coef_status_tx_first_90,
+    xb_tx_post90 = coef_status + coef_tx + coef_status_tx
+  )
+
+# Estimate standard error of HR (can't use Coxme for this lincomR function)
+library(epimisc)
+lincom_1A <- lincomR(coxph_status_donor, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_1B <- lincomR(coxph_status_donor, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_2_3tier <- lincomR(coxph_status_donor, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_1 <- lincomR(coxph_status_donor, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_2 <- lincomR(coxph_status_donor, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_3 <- lincomR(coxph_status_donor, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_4 <- lincomR(coxph_status_donor, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_5 <- lincomR(coxph_status_donor, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_6 <- lincomR(coxph_status_donor, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+detach(package:epimisc) #to reduce interference with dplyr
+detach(package:plyr)
+
+
+#Create data for plot
+hr_plot_donor <- ts_tx_code_donor %>%
+  group_by(status_def) %>%
+  mutate(
+    se_hr = as.numeric(case_when(
+      clean_status==2010 ~ paste0(lincom_1A$se.est),
+      clean_status==2020 ~ paste0(lincom_1B$se.est),
+      clean_status==2030 ~ paste0(lincom_2_3tier$se.est),
+      clean_status==2110 ~ paste0(lincom_1$se.est),
+      clean_status==2120 ~ paste0(lincom_2$se.est),
+      clean_status==2130 ~ paste0(lincom_3$se.est),
+      clean_status==2140 ~ paste0(lincom_4$se.est),
+      clean_status==2150 ~ paste0(lincom_5$se.est),
+      clean_status==2160 ~ paste0(lincom_6$se.est),
+      TRUE ~ paste0(0)
+    )),
+    #in exp so log transform -> log scale
+    avg_loghr = mean(xb_tx_post90 - xb_wait),
+    avg_hr = exp(avg_loghr),
+    min_hr = exp(avg_loghr - 1.96*se_hr),
+    max_hr = exp(avg_loghr + 1.96*se_hr),
+  ) %>%
+  ungroup() 
+
+hr_avg_donor<- hr_plot_donor %>% distinct(clean_status, status_def, avg_hr, min_hr, max_hr, policy)
+
+#Plot
+ggplot(data=hr_plot_donor, aes(y=status_def, x=avg_hr, xmin=min_hr, xmax=max_hr)) +
+  geom_point(aes(color = factor(policy)), size=4) +
+  geom_errorbarh(height=.1) +
+  labs(title='Long-Run HR(Death with Transplant | Death on Waitlist) by Status, Controlling for Donor Covariates', x='HR(transplant|waitlist)', y = 'Status') +
+  scale_y_discrete(limits=c("Status 1", "Status 2", "Status 3", "Status 4", "Status 5", "Status 6", "Status 1A", "Status 1B", "Status 2 (3 tier)")) +
+  scale_x_continuous(trans="log10", limits=c(0.01,10)) + 
+  geom_vline(xintercept=1, color='black', linetype='dashed', alpha=.5) + 
+  theme_classic() +
+    theme(
+    plot.title = element_text(hjust = 0.5, size = 12), 
+    axis.title.x = element_text(margin = margin(t = 10)), 
+    axis.title.y = element_text(margin = margin(r = 10))
+    ) +          
+  scale_color_jama()
+
+ggsave("3_year_benefit_donor_control.pdf")
+
+```
+
+```{r Candidate Covariates}
+
+ts_status_code_can <- ts_status_code %>%
+  left_join(cand_thor %>%
+              select(CAN_AGE_AT_LISTING,
+                     CAN_GENDER,
+                     CAN_BMI,
+                     CAN_RACE,
+                     CAN_DGN,
+                     CAN_DIAB_TY,
+                     CAN_DIAL,
+                     CAN_FUNCTN_STAT,
+                     CAN_VENTILATOR,
+                     PX_ID
+                      ), by = "PX_ID") %>%
+   mutate(
+     Gender = factor(CAN_GENDER, levels = c("F", "M")),
+     Race = case_when(CAN_RACE==8 ~ "White",
+                          CAN_RACE==16 ~ "Black",
+                          CAN_RACE==2000 ~ "Hispanic", 
+                          TRUE ~ "Other"),
+        Diagnosis = case_when(
+          CAN_DGN>999 & CAN_DGN<1007 ~ "Dilated cardiomyopathy, non-ischemic",
+          CAN_DGN == 1007 | CAN_DGN ==1200 ~ "Ischemic cardiomyopathy",
+          CAN_DGN>1048 & CAN_DGN< 1100 ~ "Restrictive cardiomyopathy",
+          TRUE ~ "Other"
+        ),
+        Diagnosis = factor(Diagnosis, 
+                           levels = c("Dilated cardiomyopathy, non-ischemic", 
+                                      "Ischemic cardiomyopathy", 
+                                      "Restrictive cardiomyopathy", 
+                                      "Other")),
+        Diabetes = case_when(
+          CAN_DIAB_TY>1 & CAN_DIAB_TY<6 ~ "zHistory of DM",
+          CAN_DIAB_TY ==1 ~ "Non-diabetic",
+          TRUE ~ "Unknown"
+        ),
+        Dialysis = case_when(
+          CAN_DIAL ==1 ~ "No dialysis",
+          CAN_DIAL ==2 ~ "zHemodialysis",
+          CAN_DIAL ==3 ~ "Peritoneal Dialysis",
+          TRUE ~ "Unknown"
+        ),
+        Functional_Status = case_when(
+          CAN_FUNCTN_STAT == 1 | (CAN_FUNCTN_STAT>2069) ~"Limited Impairment, 10-30%",
+          (CAN_FUNCTN_STAT>2039 & CAN_FUNCTN_STAT<2061) ~ "Moderate Impairment, 40-60%",
+          (CAN_FUNCTN_STAT>2000 & CAN_FUNCTN_STAT<2031) ~ "Severe Impairment, 70-100%",
+          TRUE ~ "Unknown"
+        ),
+        Functional_Status = ifelse(is.na(Functional_Status), "Unknown", Functional_Status),
+        Ventilator = if_else(CAN_VENTILATOR==1, "ventilator","no ventilation")
+        )
+
+#COX Model With Candidate Covariates
+coxph_status_can <- coxph(
+  Surv(t_1, t_2, dead) ~ tx_obs_flag + tx_first_90 + status_1A + status_1B + status1 + status2 + status3 + status4 + status5 + status6 + Diagnosis + Diabetes + Dialysis + Functional_Status + Ventilator +
+    tx_obs_flag*(status_1A + status_1B + status1 + status2 + status3 + status4 + status5 + status6) +
+    tx_first_90*(status_1A + status_1B + status1 + status2 + status3 + status4 + status5 + status6) +
+    cluster(center),
+  data = ts_status_code_can
+)
+print(coxph_status_can)
+
+
+
+ts_tx_code_can <- ts_status_code_can %>% 
+  filter(first_tx_ob==1) %>% 
+  select(PX_ID, clean_status, status_def, tx_obs_flag, center, policy, dead, tx_obs_flag, t_1, t_2, 
+         date_start, date_end, fin_date, rem_cd, 
+         status_1A, status_1B, status_2, status1, status2, status3, status4, status6) %>%
+  mutate(
+    status_def = case_when(clean_status==2030 ~ paste0("Status 2 (3 tier)"),
+                           TRUE ~ paste0(status_def)),
+    coef_tx = coxph_status_can$coefficients[1],
+    coef_tx_first_90 = coxph_status_can$coefficients[2],
+    coef_status = as.numeric(case_when(
+      clean_status==2010 ~ paste0(coxph_status_can$coefficients[3]),
+      clean_status==2020 ~ paste0(coxph_status_can$coefficients[4]),
+      clean_status==2030 ~ paste0(1),
+      clean_status==2110 ~ paste0(coxph_status_can$coefficients[5]),
+      clean_status==2120 ~ paste0(coxph_status_can$coefficients[6]),
+      clean_status==2130 ~ paste0(coxph_status_can$coefficients[7]),
+      clean_status==2140 ~ paste0(coxph_status_can$coefficients[8]),
+      clean_status==2150 ~ paste0(coxph_status_can$coefficients[9]),
+      clean_status==2160 ~ paste0(coxph_status_can$coefficients[10]),
+      
+      TRUE ~ paste0(0)
+    )),
+    coef_status_tx = as.numeric(case_when(
+      clean_status==2010 ~ paste0(coxph_status_can$coefficients[23]),
+      clean_status==2020 ~ paste0(coxph_status_can$coefficients[24]),
+      clean_status==2030 ~ paste0(1),
+      clean_status==2110 ~ paste0(coxph_status_can$coefficients[25]),
+      clean_status==2120 ~ paste0(coxph_status_can$coefficients[26]),
+      clean_status==2130 ~ paste0(coxph_status_can$coefficients[27]),
+      clean_status==2140 ~ paste0(coxph_status_can$coefficients[28]),
+      clean_status==2150 ~ paste0(coxph_status_can$coefficients[29]),
+      clean_status==2160 ~ paste0(coxph_status_can$coefficients[30]),
+      TRUE ~ paste0(0)
+    )),
+    coef_status_tx_first_90 = as.numeric(case_when(
+      clean_status==2010 ~ paste0(coxph_status_can$coefficients[31]),
+      clean_status==2020 ~ paste0(coxph_status_can$coefficients[32]),
+      clean_status==2030 ~ paste0(1),
+      clean_status==2110 ~ paste0(coxph_status_can$coefficients[33]),
+      clean_status==2120 ~ paste0(coxph_status_can$coefficients[34]),
+      clean_status==2130 ~ paste0(coxph_status_can$coefficients[35]),
+      clean_status==2140 ~ paste0(coxph_status_can$coefficients[36]),
+      clean_status==2150 ~ paste0(coxph_status_can$coefficients[37]),
+      clean_status==2160 ~ paste0(coxph_status_can$coefficients[38]),
+      TRUE ~ paste0(0)
+    )),
+    xb_wait = coef_status,
+    xb_tx_pre90 = coef_status + coef_tx + coef_status_tx + coef_tx_first_90 + coef_status_tx_first_90,
+    xb_tx_post90 = coef_status + coef_tx + coef_status_tx
+  )
+
+# Estimate standard error of HR (can't use Coxme for this lincomR function)
+library(epimisc)
+lincom_1A <- lincomR(coxph_status_can, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_1B <- lincomR(coxph_status_can, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_2_3tier <- lincomR(coxph_status_can, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_1 <- lincomR(coxph_status_can, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_2 <- lincomR(coxph_status_can, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_3 <- lincomR(coxph_status_can, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_4 <- lincomR(coxph_status_can, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_5 <- lincomR(coxph_status_can, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_6 <- lincomR(coxph_status_can, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+detach(package:epimisc) #to reduce interference with dplyr
+detach(package:plyr)
+
+#Create data for dot plot
+hr_plot_can <- ts_tx_code_can %>%
+  group_by(status_def) %>%
+  mutate(
+    se_hr = as.numeric(case_when(
+      clean_status==2010 ~ paste0(lincom_1A$se.est),
+      clean_status==2020 ~ paste0(lincom_1B$se.est),
+      clean_status==2030 ~ paste0(lincom_2_3tier$se.est),
+      clean_status==2110 ~ paste0(lincom_1$se.est),
+      clean_status==2120 ~ paste0(lincom_2$se.est),
+      clean_status==2130 ~ paste0(lincom_3$se.est),
+      clean_status==2140 ~ paste0(lincom_4$se.est),
+      clean_status==2150 ~ paste0(lincom_5$se.est),
+      clean_status==2160 ~ paste0(lincom_6$se.est),
+      TRUE ~ paste0(0)
+    )),
+    #in exp so log transform -> log scale
+    avg_loghr = mean(xb_tx_post90 - xb_wait),
+    avg_hr = exp(avg_loghr),
+    min_hr = exp(avg_loghr - 1.96*se_hr),
+    max_hr = exp(avg_loghr + 1.96*se_hr),
+  ) %>%
+  ungroup() 
+
+hr_avg_can<- hr_plot_can %>% distinct(clean_status, status_def, avg_hr, min_hr, max_hr, policy)
+
+#Plot
+ggplot(data=hr_plot_can, aes(y=status_def, x=avg_hr, xmin=min_hr, xmax=max_hr)) +
+  geom_point(aes(color = factor(policy)), size=4) +
+  geom_errorbarh(height=.1) +
+  labs(title='HR(Death with Transplant | Death on Waitlist) by Status, Controlling for Candidate Covariates', x='HR(transplant|waitlist)', y = 'Status') +
+  scale_y_discrete(limits=c("Status 1", "Status 2", "Status 3", "Status 4", "Status 5", "Status 6", "Status 1A", "Status 1B", "Status 2 (3 tier)")) +
+  scale_x_continuous(trans="log10", limits=c(0.01,10)) + 
+  geom_vline(xintercept=1, color='black', linetype='dashed', alpha=.5) + 
+  theme_classic() +
+    theme(
+    plot.title = element_text(hjust = 0.5, size = 12), 
+    axis.title.x = element_text(margin = margin(t = 10)), 
+    axis.title.y = element_text(margin = margin(r = 10))
+    ) +          
+  scale_color_jama()
+
+ggsave("3_year_benefit_can_control.pdf")
+
+```
