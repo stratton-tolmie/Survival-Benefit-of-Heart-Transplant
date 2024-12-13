@@ -598,3 +598,131 @@ ggplot(data=hr_plot_can, aes(y=status_def, x=avg_hr, xmin=min_hr, xmax=max_hr)) 
 ggsave("3_year_benefit_can_control.pdf")
 
 ```
+
+
+```{r DCD OCS Sensitivity Analysis}
+
+#Create DCD flag variable
+ts_status_code_dcd <- ts_status_code %>% 
+  left_join(tx_hr %>%
+              select(PX_ID, DON_NON_HR_BEAT), by="PX_ID") %>%
+  mutate(
+    dcd_flag = case_when(
+      tx_obs_flag==1 & DON_NON_HR_BEAT=="Y" ~ 1, TRUE~0)
+  )
+
+#COX Model With Candidate Covariates
+coxph_status_dcd <- coxph(Surv(t_1, t_2, dead) ~ tx_obs_flag + tx_first_90 + status_1A + status_1B + status1 + status2 + status3 + status4 + status5 + status6 + tx_obs_flag*(status_1A + status_1B + status1 + status2 + status3 + status4 + status5 + status6) + tx_first_90*(status_1A + status_1B + status1 + status2 + status3 + status4 + status5 + status6) + dcd_flag, data=ts_status_code_dcd, cluster=center)
+print(coxph_status_dcd)
+
+
+ts_tx_code_dcd <- ts_status_code_dcd %>% 
+  filter(first_tx_ob==1) %>% 
+  select(PX_ID, clean_status, status_def, tx_obs_flag, center, policy, dead, tx_obs_flag, t_1, t_2, 
+         date_start, date_end, fin_date, rem_cd, 
+         status_1A, status_1B, status_2, status1, status2, status3, status4, status6) %>%
+  mutate(
+    status_def = case_when(clean_status==2030 ~ paste0("Status 2 (3 tier)"),
+                           TRUE ~ paste0(status_def)),
+    coef_tx = as.numeric(coxph_status_dcd$coefficients[1]),
+    coef_tx_first_90 = as.numeric(coxph_status_dcd$coefficients[2]),
+    coef_status = as.numeric(case_when(
+      clean_status==2010 ~ paste0(coxph_status_dcd$coefficients[3]),
+      clean_status==2020 ~ paste0(coxph_status_dcd$coefficients[4]),
+      clean_status==2030 ~ paste0(1),
+      clean_status==2110 ~ paste0(coxph_status_dcd$coefficients[5]),
+      clean_status==2120 ~ paste0(coxph_status_dcd$coefficients[6]),
+      clean_status==2130 ~ paste0(coxph_status_dcd$coefficients[7]),
+      clean_status==2140 ~ paste0(coxph_status_dcd$coefficients[8]),
+      clean_status==2150 ~ paste0(coxph_status_dcd$coefficients[9]),
+      clean_status==2160 ~ paste0(coxph_status_dcd$coefficients[10]),
+      
+      TRUE ~ paste0(0)
+    )),
+    coef_status_tx = as.numeric(case_when(
+      clean_status==2010 ~ paste0(coxph_status_dcd$coefficients[12]),
+      clean_status==2020 ~ paste0(coxph_status_dcd$coefficients[13]),
+      clean_status==2030 ~ paste0(1),
+      clean_status==2110 ~ paste0(coxph_status_dcd$coefficients[14]),
+      clean_status==2120 ~ paste0(coxph_status_dcd$coefficients[15]),
+      clean_status==2130 ~ paste0(coxph_status_dcd$coefficients[16]),
+      clean_status==2140 ~ paste0(coxph_status_dcd$coefficients[17]),
+      clean_status==2150 ~ paste0(coxph_status_dcd$coefficients[18]),
+      clean_status==2160 ~ paste0(coxph_status_dcd$coefficients[19]),
+      TRUE ~ paste0(0)
+    )),
+    coef_status_tx_first_90 = as.numeric(case_when(
+      clean_status==2010 ~ paste0(coxph_status_dcd$coefficients[20]),
+      clean_status==2020 ~ paste0(coxph_status_dcd$coefficients[21]),
+      clean_status==2030 ~ paste0(1),
+      clean_status==2110 ~ paste0(coxph_status_dcd$coefficients[22]),
+      clean_status==2120 ~ paste0(coxph_status_dcd$coefficients[23]),
+      clean_status==2130 ~ paste0(coxph_status_dcd$coefficients[24]),
+      clean_status==2140 ~ paste0(coxph_status_dcd$coefficients[25]),
+      clean_status==2150 ~ paste0(coxph_status_dcd$coefficients[26]),
+      clean_status==2160 ~ paste0(coxph_status_dcd$coefficients[27]),
+      TRUE ~ paste0(0)
+    )),
+    xb_wait = coef_status,
+    xb_tx_pre90 = coef_status + coef_tx + coef_status_tx + coef_tx_first_90 + coef_status_tx_first_90,
+    xb_tx_post90 = coef_status + coef_tx + coef_status_tx
+  )
+
+# Estimate standard error of HR (can't use Coxme for this lincomR function)
+library(epimisc)
+lincom_1A <- lincomR(coxph_status_dcd, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_1B <- lincomR(coxph_status_dcd, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_2_3tier <- lincomR(coxph_status_dcd, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_1 <- lincomR(coxph_status_dcd, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_2 <- lincomR(coxph_status_dcd, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_3 <- lincomR(coxph_status_dcd, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_4 <- lincomR(coxph_status_dcd, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_5 <- lincomR(coxph_status_dcd, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+lincom_6 <- lincomR(coxph_status_dcd, c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0), conflev = 0.95, digits = 3)
+detach(package:epimisc) #to reduce interference with dplyr
+detach(package:plyr)
+
+
+#Create data for dot plot
+hr_plot_dcd <- ts_tx_code_dcd %>%
+  group_by(status_def) %>%
+  mutate(
+    se_hr = as.numeric(case_when(
+      clean_status==2010 ~ paste0(lincom_1A$se.est),
+      clean_status==2020 ~ paste0(lincom_1B$se.est),
+      clean_status==2030 ~ paste0(lincom_2_3tier$se.est),
+      clean_status==2110 ~ paste0(lincom_1$se.est),
+      clean_status==2120 ~ paste0(lincom_2$se.est),
+      clean_status==2130 ~ paste0(lincom_3$se.est),
+      clean_status==2140 ~ paste0(lincom_4$se.est),
+      clean_status==2150 ~ paste0(lincom_5$se.est),
+      clean_status==2160 ~ paste0(lincom_6$se.est),
+      TRUE ~ paste0(0)
+    )),
+    #in exp so log transform -> log scale
+    avg_loghr = mean(xb_tx_post90 - xb_wait),
+    avg_hr = exp(avg_loghr),
+    min_hr = exp(avg_loghr - 1.96*se_hr),
+    max_hr = exp(avg_loghr + 1.96*se_hr),
+  ) %>%
+  ungroup() 
+
+hr_avg_dcd<- hr_plot_dcd %>% distinct(clean_status, status_def, avg_hr, min_hr, max_hr, policy)
+
+#Plot
+ggplot(data=hr_plot_dcd, aes(y=status_def, x=avg_hr, xmin=min_hr, xmax=max_hr)) +
+  geom_point(aes(color = factor(policy)), size=4) +
+  geom_errorbarh(height=.1) +
+  labs(title='HR(Death with Transplant | Death on Waitlist) by Status, Controlling for DCD Transplantation', x='HR(transplant|waitlist)', y = 'Status') +
+  scale_y_discrete(limits=c("Status 1", "Status 2", "Status 3", "Status 4", "Status 5", "Status 6", "Status 1A", "Status 1B", "Status 2 (3 tier)")) +
+  scale_x_continuous(trans="log10", limits=c(0.01,10)) + 
+  geom_vline(xintercept=1, color='black', linetype='dashed', alpha=.5) + 
+  theme_classic() +
+    theme(
+    plot.title = element_text(hjust = 0.5, size = 12), 
+    axis.title.x = element_text(margin = margin(t = 10)), 
+    axis.title.y = element_text(margin = margin(r = 10))
+    ) +          
+  scale_color_jama()
+
+```
